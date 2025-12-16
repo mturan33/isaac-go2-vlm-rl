@@ -1,2 +1,2 @@
 # isaac-go2-vlm-rl
-Neuro-Symbolic AI for Robotics
+VLM + RL Neuro-Symbolic AI for Robotics

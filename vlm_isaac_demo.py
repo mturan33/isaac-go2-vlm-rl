@@ -27,7 +27,6 @@ import sys
 import types
 import importlib.util
 
-
 # ============================================================
 # Flash Attention Bypass (MUST BE FIRST)
 # ============================================================
@@ -60,7 +59,6 @@ def setup_flash_attn_bypass():
 
     print("[PATCH] Flash attention bypass installed")
 
-
 setup_flash_attn_bypass()
 # ============================================================
 
@@ -69,12 +67,13 @@ from isaaclab.app import AppLauncher
 # Argument parser
 parser = argparse.ArgumentParser(description="VLM Navigation Demo for Go2")
 parser.add_argument("--task", type=str, default="Isaac-Velocity-Flat-Unitree-Go2-v0",
-                    help="Isaac Lab task name")
+                   help="Isaac Lab task name")
 parser.add_argument("--checkpoint", type=str,
-                    default="logs/rsl_rl/unitree_go2_flat/model_best.pt",
-                    help="Path to trained policy checkpoint")
+                   default="logs/rsl_rl/unitree_go2_flat/model_best.pt",
+                   help="Path to trained policy checkpoint")
 parser.add_argument("--num_envs", type=int, default=1)
 parser.add_argument("--disable_vlm", action="store_true", help="Disable VLM for testing")
+parser.add_argument("--disable_fabric", action="store_true", help="Disable fabric for debugging")
 
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
@@ -88,6 +87,7 @@ import carb
 import omni.appwindow
 import gymnasium as gym
 import isaaclab_tasks
+from isaaclab_tasks.utils import parse_env_cfg
 
 
 # ============================================================
@@ -196,7 +196,7 @@ class VLMNavigator:
             x1, y1, x2, y2 = bbox
             cx = (x1 + x2) / 2
             result["x"] = (cx / w) * 2 - 1
-            area = (x2 - x1) * (y2 - y1) / (w * h)
+            area = (x2-x1) * (y2-y1) / (w*h)
             result["distance"] = max(0.1, 1.0 - area * 5)
             result["found"] = True
             result["bbox"] = [int(x1), int(y1), int(x2), int(y2)]
@@ -353,13 +353,22 @@ class KeyboardHandler:
 # Main
 # ============================================================
 def main():
-    print("\n" + "=" * 60)
+    print("\n" + "="*60)
     print("       VLM Navigation Demo - Isaac Lab + Go2")
-    print("=" * 60)
+    print("="*60)
 
     # Create environment
     print(f"[ENV] Creating: {args_cli.task}")
-    env = gym.make(args_cli.task, cfg=None, render_mode="rgb_array")
+
+    # Parse environment config (required for Isaac Lab)
+    env_cfg = parse_env_cfg(
+        args_cli.task,
+        device="cuda:0",
+        num_envs=args_cli.num_envs,
+        use_fabric=not args_cli.disable_fabric
+    )
+
+    env = gym.make(args_cli.task, cfg=env_cfg)
     unwrapped = env.unwrapped
 
     num_obs = unwrapped.observation_space["policy"].shape[1]
@@ -384,7 +393,7 @@ def main():
         # Find hidden dims
         hidden_dims = []
         for i in range(10):
-            key = f"actor.{i * 2}.weight"
+            key = f"actor.{i*2}.weight"
             if key in state_dict:
                 hidden_dims.append(state_dict[key].shape[0])
         if hidden_dims:
@@ -428,14 +437,14 @@ def main():
     keyboard = KeyboardHandler()
 
     # Print controls
-    print("\n" + "=" * 60)
+    print("\n" + "="*60)
     print("                    CONTROLS")
-    print("=" * 60)
+    print("="*60)
     print("  SPACE     - Change navigation target")
     print("  R         - Reset robot")
     print("  V         - Print VLM status")
     print("  ESC       - Quit")
-    print("=" * 60)
+    print("="*60)
     print(f"\n[START] Target: {vlm_ctrl.current_target}\n")
 
     # Reset environment

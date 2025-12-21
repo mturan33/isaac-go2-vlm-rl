@@ -193,12 +193,15 @@ class RobotMountedCamera:
                 camera.GetClippingRangeAttr().Set(Gf.Vec2f(0.1, 100.0))
 
                 # Set local transform relative to base
+                # Camera default: -Z forward, +Y up
+                # We want: +X forward, +Z up
+                # Quaternion (w, x, y, z) = (0.5, 0.5, -0.5, -0.5)
                 xform = UsdGeom.Xformable(camera.GetPrim())
                 xform.ClearXformOpOrder()
                 xform.AddTranslateOp().Set(Gf.Vec3d(*self.offset))
-                xform.AddRotateXYZOp().Set(Gf.Vec3f(*self.rotation))
+                xform.AddOrientOp().Set(Gf.Quatf(0.5, 0.5, -0.5, -0.5))
 
-                print(f"[CAMERA] Offset: {self.offset}, Rotation: {self.rotation}")
+                print(f"[CAMERA] Offset: {self.offset}, Quaternion: (0.5, 0.5, -0.5, -0.5)")
 
             return self._setup_replicator()
 

@@ -1,7 +1,7 @@
 """
-Isaac Lab VLM Navigation Demo - Go2 Robot (v7)
+Isaac Lab VLM Navigation Demo - Go2 Robot (v8)
 ===============================================
-Uses Isaac Lab's native Camera sensor instead of blocking Replicator API
+Non-blocking Replicator camera - no rep.orchestrator.step()!
 """
 
 import argparse
@@ -68,9 +68,93 @@ import gymnasium as gym
 import isaaclab_tasks
 from isaaclab_tasks.utils import parse_env_cfg
 
-# Isaac Lab sensor imports
-import isaaclab.sim as sim_utils
-from isaaclab.sensors import Camera, CameraCfg
+# Replicator imports
+import omni.replicator.core as rep
+
+
+# ============================================================
+# Non-blocking Camera using Replicator
+# ============================================================
+class ReplicatorCamera:
+    """Camera using Replicator without blocking orchestrator.step()"""
+
+    def __init__(self, camera_path: str, width: int = 320, height: int = 240):
+        self.camera_path = camera_path
+        self.width = width
+        self.height = height
+        self.render_product = None
+        self.rgb_annotator = None
+        self.last_image = None
+        self.initialized = False
+
+    def setup(self):
+        """Setup camera after simulation starts"""
+        try:
+            stage = omni.usd.get_context().get_stage()
+
+            # Check if camera prim exists, if not create it
+            camera_prim = stage.GetPrimAtPath(self.camera_path)
+            if not camera_prim.IsValid():
+                print(f"[CAMERA] Creating camera at {self.camera_path}")
+                camera = UsdGeom.Camera.Define(stage, self.camera_path)
+                camera.GetFocalLengthAttr().Set(24.0)
+                camera.GetHorizontalApertureAttr().Set(20.955)
+                camera.GetClippingRangeAttr().Set(Gf.Vec2f(0.1, 100.0))
+
+                # Set position (world camera looking at scene)
+                xform = UsdGeom.Xformable(camera.GetPrim())
+                xform.ClearXformOpOrder()
+                xform.AddTranslateOp().Set(Gf.Vec3d(0.0, -5.0, 3.0))
+                # Rotate to look at origin
+                xform.AddRotateXYZOp().Set(Gf.Vec3f(60.0, 0.0, 0.0))
+
+            # Create render product
+            self.render_product = rep.create.render_product(
+                self.camera_path,
+                resolution=(self.width, self.height)
+            )
+
+            # Create RGB annotator
+            self.rgb_annotator = rep.AnnotatorRegistry.get_annotator("rgb")
+            self.rgb_annotator.attach([self.render_product])
+
+            self.initialized = True
+            print(f"[CAMERA] Initialized! Resolution: {self.width}x{self.height}")
+            return True
+
+        except Exception as e:
+            print(f"[CAMERA] Setup failed: {e}")
+            traceback.print_exc()
+            return False
+
+    def get_image(self) -> np.ndarray:
+        """Get current camera image without blocking"""
+        if not self.initialized:
+            return None
+
+        try:
+            # Get data from annotator (non-blocking - uses last rendered frame)
+            data = self.rgb_annotator.get_data()
+
+            if data is not None and len(data) > 0:
+                # Convert to numpy array
+                if isinstance(data, np.ndarray):
+                    img = data
+                else:
+                    img = np.array(data)
+
+                # Handle different formats
+                if len(img.shape) == 3:
+                    if img.shape[2] == 4:  # RGBA -> RGB
+                        img = img[:, :, :3]
+                    self.last_image = img
+                    return img
+
+            return self.last_image  # Return last valid image
+
+        except Exception as e:
+            # Don't spam errors
+            return self.last_image
 
 
 # ============================================================
@@ -249,7 +333,7 @@ def spawn_target_objects():
 # ============================================================
 def main():
     print("\n" + "="*60)
-    print("     VLM Navigation Demo - Go2 (v7 - Native Camera)")
+    print("     VLM Navigation Demo - Go2 (v8 - Non-blocking Camera)")
     print("="*60)
 
     # Create environment
@@ -284,47 +368,38 @@ def main():
         print(f"[ERROR] Policy: {e}")
         return
 
-    # Reset env first
+    # Reset env first (this starts simulation)
     obs_dict, _ = env.reset()
     obs = obs_dict["policy"] if isinstance(obs_dict, dict) else obs_dict
 
     # Spawn objects
     spawn_target_objects()
 
-    # Setup Isaac Lab Camera sensor (non-blocking!)
-    camera_sensor = None
+    # Setup camera AFTER simulation starts
+    camera = None
     if not args_cli.no_camera:
-        print("\n[CAMERA] Setting up Isaac Lab Camera sensor...")
-        try:
-            # Create camera config - attached to robot base, looking forward
-            camera_cfg = CameraCfg(
-                prim_path="/World/envs/env_0/Robot/base/front_cam",
-                update_period=0.1,  # 10 Hz
-                height=240,
-                width=320,
-                data_types=["rgb"],
-                spawn=sim_utils.PinholeCameraCfg(
-                    focal_length=24.0,
-                    focus_distance=400.0,
-                    horizontal_aperture=20.955,
-                    clipping_range=(0.1, 100.0)
-                ),
-                offset=CameraCfg.OffsetCfg(
-                    pos=(0.35, 0.0, 0.1),  # 35cm forward, 10cm up from base
-                    rot=(0.5, -0.5, 0.5, -0.5),  # Looking forward (ROS convention)
-                    convention="ros"
-                ),
-            )
-            camera_sensor = Camera(camera_cfg)
-            print(f"[CAMERA] Created! Resolution: {camera_cfg.width}x{camera_cfg.height}")
-        except Exception as e:
-            print(f"[CAMERA] Failed: {e}")
-            traceback.print_exc()
-            camera_sensor = None
+        print("\n[CAMERA] Setting up...")
+        camera = ReplicatorCamera(
+            camera_path="/World/VLMCamera",
+            width=320,
+            height=240
+        )
+
+        # Wait a few frames for simulation to stabilize
+        for _ in range(10):
+            with torch.no_grad():
+                actions = actor(obs)
+            obs_dict, _, _, _, _ = env.step(actions)
+            obs = obs_dict["policy"] if isinstance(obs_dict, dict) else obs_dict
+
+        # Now setup camera
+        if not camera.setup():
+            print("[CAMERA] Setup failed, continuing without camera")
+            camera = None
 
     # Setup VLM
     vlm = None
-    if not args_cli.no_vlm:
+    if not args_cli.no_vlm and camera is not None:
         print("\n[VLM] Initializing...")
         try:
             vlm = VLMNavigator(device=str(device))
@@ -350,11 +425,11 @@ def main():
     print("  SPACE - Next target | R - Reset | ESC - Quit")
     print("="*60)
     print(f"\n[START] Target: {targets[target_idx]}")
-    print(f"[START] VLM: {vlm is not None}, Camera: {camera_sensor is not None}\n")
+    print(f"[START] VLM: {vlm is not None}, Camera: {camera is not None}\n")
 
     step = 0
     vlm_interval = 30  # VLM every 30 steps (~0.6s at 50Hz)
-    sim_dt = 0.02  # 50Hz
+    camera_warmup = 50  # Wait for camera to warm up
 
     # Main loop
     while simulation_app.is_running():
@@ -371,33 +446,18 @@ def main():
         if keyboard.just_pressed("R"):
             obs_dict, _ = env.reset()
             obs = obs_dict["policy"] if isinstance(obs_dict, dict) else obs_dict
-            if camera_sensor:
-                camera_sensor.reset()
             print("\n[RESET]")
 
         # Debug every 100 steps
         if step % 100 == 0:
             print(f"[STEP {step:5d}] cmd=[{command[0,0]:.2f}, {command[0,1]:.2f}, {command[0,2]:.2f}]")
 
-        # Update camera sensor (non-blocking!)
-        if camera_sensor is not None:
+        # VLM inference (after camera warmup)
+        if vlm is not None and camera is not None and step > camera_warmup and step % vlm_interval == 0:
             try:
-                camera_sensor.update(dt=sim_dt)
-            except Exception as e:
-                if step % 100 == 0:
-                    print(f"[CAMERA] Update error: {e}")
+                img = camera.get_image()
 
-        # VLM inference
-        if vlm is not None and camera_sensor is not None and step % vlm_interval == 0 and step > 0:
-            try:
-                # Get image from camera sensor
-                rgb_data = camera_sensor.data.output.get("rgb")
-                if rgb_data is not None and rgb_data.numel() > 0:
-                    # Convert to numpy (H, W, C)
-                    img = rgb_data[0].cpu().numpy()  # First env
-                    if img.shape[-1] == 4:  # RGBA -> RGB
-                        img = img[:, :, :3]
-
+                if img is not None:
                     if step % 100 == 0:
                         print(f"[CAMERA] Got image: {img.shape}, dtype: {img.dtype}")
 
@@ -421,11 +481,11 @@ def main():
                         command = torch.tensor([[0.15, 0.0, 0.4 * search_dir]], device=device, dtype=torch.float32)
                 else:
                     if step % 100 == 0:
-                        print(f"[CAMERA] No image data yet")
+                        print(f"[CAMERA] No image yet")
 
             except Exception as e:
-                print(f"[VLM] Error: {e}")
-                traceback.print_exc()
+                if step % 100 == 0:
+                    print(f"[VLM] Error: {e}")
 
         # Apply velocity command
         if cmd_term is not None:
@@ -443,15 +503,13 @@ def main():
         with torch.no_grad():
             actions = actor(obs)
 
-        # Step environment
+        # Step environment (this also renders!)
         obs_dict, rewards, terminated, truncated, info = env.step(actions)
         obs = obs_dict["policy"] if isinstance(obs_dict, dict) else obs_dict
 
         if (terminated | truncated).any():
             obs_dict, _ = env.reset()
             obs = obs_dict["policy"] if isinstance(obs_dict, dict) else obs_dict
-            if camera_sensor:
-                camera_sensor.reset()
             print("\n[ENV] Episode reset")
 
         step += 1

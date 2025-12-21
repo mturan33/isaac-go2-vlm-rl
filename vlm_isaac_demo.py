@@ -104,12 +104,15 @@ try:
     # Test if GUI functions are available
     try:
         # This will fail if highgui is not compiled with GUI support
-        cv2.namedWindow("_test_", cv2.WINDOW_NORMAL)
-        cv2.destroyWindow("_test_")
-        CV2_GUI_AVAILABLE = True
-        print("[VIEWPORT] OpenCV GUI loaded")
-    except cv2.error:
-        print("[VIEWPORT] OpenCV loaded but GUI not available (headless mode)")
+        if hasattr(cv2, 'namedWindow'):
+            cv2.namedWindow("_test_", cv2.WINDOW_NORMAL)
+            cv2.destroyWindow("_test_")
+            CV2_GUI_AVAILABLE = True
+            print("[VIEWPORT] OpenCV GUI loaded")
+        else:
+            print("[VIEWPORT] OpenCV loaded (headless - no GUI)")
+    except Exception as e:
+        print(f"[VIEWPORT] OpenCV loaded but GUI not available: {e}")
 except ImportError:
     print("[VIEWPORT] OpenCV not available")
 
@@ -271,13 +274,18 @@ class RobotMountedCamera:
 # OpenCV Viewport Display (NEW in v9)
 # ============================================================
 class ViewportDisplay:
-    """Ayrı pencerede kamera görüntüsü göster"""
+    """Ayrı pencerede kamera görüntüsü göster veya dosyaya kaydet"""
 
     def __init__(self, window_name: str = "Go2 Camera - Press V to toggle"):
         self.window_name = window_name
         self.enabled = CV2_GUI_AVAILABLE and not args_cli.no_viewport
         self.window_created = False
         self.setup_failed = False  # Prevent repeated error messages
+
+        # Save to file mode (when GUI not available)
+        self.save_mode = CV2_AVAILABLE and not CV2_GUI_AVAILABLE
+        self.save_counter = 0
+        self.save_interval = 30  # Save every N updates
 
         # Overlay info
         self.target_name = ""
@@ -286,6 +294,10 @@ class ViewportDisplay:
         self.last_bbox = None
 
     def setup(self):
+        if self.save_mode:
+            print("[VIEWPORT] GUI not available - will save images to 'camera_capture.png'")
+            return True
+
         if not CV2_GUI_AVAILABLE:
             if not self.setup_failed:
                 print("[VIEWPORT] GUI not available - skipping viewport window")
@@ -308,7 +320,7 @@ class ViewportDisplay:
 
     def update(self, image: np.ndarray, target: str = None, cmd: tuple = None,
                status: str = None, bbox: list = None):
-        if not self.enabled or not self.window_created:
+        if not CV2_AVAILABLE:
             return
 
         if target:
@@ -322,19 +334,17 @@ class ViewportDisplay:
 
         # Create display image
         if image is None:
-            display = np.zeros((240, 320, 3), dtype=np.uint8)
-            cv2.putText(display, "Waiting for camera...", (50, 120),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        else:
-            # RGB to BGR for OpenCV
-            display = cv2.cvtColor(image.copy(), cv2.COLOR_RGB2BGR)
+            return
 
-            # Draw bounding box if available
-            if self.last_bbox:
-                x1, y1, x2, y2 = [int(v) for v in self.last_bbox]
-                cv2.rectangle(display, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                cv2.putText(display, self.target_name, (x1, y1 - 5),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+        # RGB to BGR for OpenCV
+        display = cv2.cvtColor(image.copy(), cv2.COLOR_RGB2BGR)
+
+        # Draw bounding box if available
+        if self.last_bbox:
+            x1, y1, x2, y2 = [int(v) for v in self.last_bbox]
+            cv2.rectangle(display, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.putText(display, self.target_name, (x1, y1 - 5),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
 
         # Draw overlay
         h, w = display.shape[:2]
@@ -361,10 +371,22 @@ class ViewportDisplay:
         cv2.line(display, (cx - 15, cy), (cx + 15, cy), (255, 255, 255), 1)
         cv2.line(display, (cx, cy - 15), (cx, cy + 15), (255, 255, 255), 1)
 
-        cv2.imshow(self.window_name, display)
-        cv2.waitKey(1)
+        # GUI mode
+        if self.window_created:
+            cv2.imshow(self.window_name, display)
+            cv2.waitKey(1)
+        # Save mode (headless)
+        elif self.save_mode:
+            self.save_counter += 1
+            if self.save_counter >= self.save_interval:
+                cv2.imwrite("camera_capture.png", display)
+                self.save_counter = 0
 
     def toggle(self):
+        if self.save_mode:
+            print("[VIEWPORT] Save mode - press S to save current frame")
+            return
+
         if not CV2_GUI_AVAILABLE:
             print("[VIEWPORT] GUI not available - cannot toggle")
             return
@@ -380,8 +402,17 @@ class ViewportDisplay:
             self.setup()
 
     def close(self):
-        if self.window_created:
+        if self.window_created and CV2_GUI_AVAILABLE:
             cv2.destroyAllWindows()
+
+    def save_now(self, image: np.ndarray):
+        """Manuel olarak şu anki frame'i kaydet"""
+        if image is not None and CV2_AVAILABLE:
+            display = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+            filename = f"camera_capture_{self.save_counter}.png"
+            cv2.imwrite(filename, display)
+            print(f"[VIEWPORT] Saved: {filename}")
+            self.save_counter += 1
 
 
 # ============================================================
@@ -708,10 +739,12 @@ def main():
     last_bbox = None
 
     print("\n" + "="*60)
-    print("  SPACE - Next target | R - Reset | V - Toggle viewport | ESC - Quit")
+    print("  SPACE - Next target | R - Reset | S - Save image | ESC - Quit")
     print("="*60)
     print(f"\n[START] Target: {targets[target_idx]}")
-    print(f"[START] VLM: {vlm is not None}, Camera: {camera is not None}, Viewport: {viewport.enabled}\n")
+    print(f"[START] VLM: {vlm is not None}, Camera: {camera is not None}")
+    viewport_status = "GUI" if viewport.window_created else ("Save" if viewport.save_mode else "Off")
+    print(f"[START] Viewport: {viewport_status}\n")
 
     step = 0
     vlm_interval = 30  # VLM every 30 steps (~0.6s at 50Hz)
@@ -738,6 +771,13 @@ def main():
 
         if keyboard.just_pressed("V"):
             viewport.toggle()
+
+        # S tuşu ile manuel kamera kaydı
+        if keyboard.just_pressed("S"):
+            if camera is not None and camera.is_ready():
+                img = camera.get_image()
+                if img is not None:
+                    viewport.save_now(img)
 
         # Debug every 100 steps
         if step % 100 == 0:
@@ -788,14 +828,15 @@ def main():
                     traceback.print_exc()
 
         # Update viewport even without VLM (for camera preview)
-        elif camera is not None and camera.is_ready() and step % 5 == 0 and viewport.enabled:
-            img = camera.get_image()
-            viewport.update(
-                image=img,
-                target=targets[target_idx],
-                cmd=tuple(command[0].cpu().tolist()),
-                status=nav_status
-            )
+        elif camera is not None and camera.is_ready() and step % 5 == 0:
+            if viewport.window_created or viewport.save_mode:
+                img = camera.get_image()
+                viewport.update(
+                    image=img,
+                    target=targets[target_idx],
+                    cmd=tuple(command[0].cpu().tolist()),
+                    status=nav_status
+                )
 
         # Apply velocity command
         if cmd_term is not None:

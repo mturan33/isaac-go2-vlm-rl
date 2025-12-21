@@ -1,7 +1,26 @@
 """
-Isaac Lab VLM Navigation Demo - Go2 Robot (v8)
+Isaac Lab VLM Navigation Demo - Go2 Robot (v9)
 ===============================================
-Non-blocking Replicator camera - no rep.orchestrator.step()!
+v8 üzerine eklenenler:
+1. Robot-mounted camera (base frame'e bağlı)
+2. OpenCV viewport penceresi (real-time görüntü)
+3. Gelişmiş navigation logic
+
+Kullanım:
+    # Full demo
+    .\isaaclab.bat -p vlm_isaac_demo_v9.py --task Isaac-Velocity-Flat-Unitree-Go2-v0 --checkpoint path/model.pt
+
+    # VLM olmadan
+    .\isaaclab.bat -p vlm_isaac_demo_v9.py --task ... --checkpoint ... --no_vlm
+
+    # Viewport penceresi kapalı
+    .\isaaclab.bat -p vlm_isaac_demo_v9.py --task ... --checkpoint ... --no_viewport
+
+Kontroller:
+    SPACE - Hedef değiştir
+    R - Reset
+    V - Viewport aç/kapat
+    ESC - Çıkış
 """
 
 import argparse
@@ -13,7 +32,7 @@ import types
 import importlib.util
 import traceback
 
-# Flash Attention Bypass
+# Flash Attention Bypass (Windows için gerekli)
 def setup_flash_attn_bypass():
     fake_flash_attn = types.ModuleType('flash_attn')
     fake_flash_attn.__file__ = __file__
@@ -39,6 +58,7 @@ def setup_flash_attn_bypass():
 
 setup_flash_attn_bypass()
 
+# Isaac Lab AppLauncher (CRITICAL - must be before other Isaac imports)
 from isaaclab.app import AppLauncher
 
 parser = argparse.ArgumentParser()
@@ -47,6 +67,7 @@ parser.add_argument("--checkpoint", type=str, required=True)
 parser.add_argument("--num_envs", type=int, default=1)
 parser.add_argument("--no_vlm", action="store_true", help="Disable VLM")
 parser.add_argument("--no_camera", action="store_true", help="Disable camera")
+parser.add_argument("--no_viewport", action="store_true", help="Disable OpenCV viewport window")
 parser.add_argument("--disable_fabric", action="store_true")
 
 AppLauncher.add_app_launcher_args(parser)
@@ -60,105 +81,292 @@ if not args_cli.no_camera:
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
+# Now import other modules (after AppLauncher)
 import carb
 import omni.appwindow
 import omni.usd
 from pxr import UsdGeom, Gf, UsdShade, Sdf
 import gymnasium as gym
-import isaaclab_tasks
+
+# Isaac Lab task imports (CRITICAL - registers environments)
+import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils import parse_env_cfg
 
 # Replicator imports
 import omni.replicator.core as rep
 
+# OpenCV for viewport (optional)
+CV2_AVAILABLE = False
+try:
+    import cv2
+    CV2_AVAILABLE = True
+    print("[VIEWPORT] OpenCV loaded")
+except ImportError:
+    print("[VIEWPORT] OpenCV not available")
+
 
 # ============================================================
-# Non-blocking Camera using Replicator
+# Robot-Mounted Camera (NEW in v9)
 # ============================================================
-class ReplicatorCamera:
-    """Camera using Replicator without blocking orchestrator.step()"""
+class RobotMountedCamera:
+    """
+    Robotun base frame'ine monte edilmiş kamera.
+    Robot hareket ettikçe kamera da hareket eder.
+    """
 
-    def __init__(self, camera_path: str, width: int = 320, height: int = 240):
-        self.camera_path = camera_path
+    def __init__(
+        self,
+        robot_prim_path: str = "/World/envs/env_0/Robot",
+        width: int = 320,
+        height: int = 240,
+        offset: tuple = (0.35, 0.0, 0.15),  # Forward, left, up from base
+        rotation: tuple = (0.0, 15.0, 0.0),  # Pitch down slightly
+    ):
+        self.robot_prim_path = robot_prim_path
         self.width = width
         self.height = height
+        self.offset = offset
+        self.rotation = rotation
+
+        # Camera will be created under robot's base link
+        self.camera_path = f"{robot_prim_path}/base/front_camera"
         self.render_product = None
         self.rgb_annotator = None
         self.last_image = None
         self.initialized = False
+        self.warmup_counter = 0
+        self.warmup_frames = 50
 
     def setup(self):
         """Setup camera after simulation starts"""
         try:
             stage = omni.usd.get_context().get_stage()
 
-            # Check if camera prim exists, if not create it
+            # First check if robot exists
+            robot_prim = stage.GetPrimAtPath(self.robot_prim_path)
+            if not robot_prim.IsValid():
+                print(f"[CAMERA] Robot not found at {self.robot_prim_path}")
+                # Try alternative path
+                self.robot_prim_path = "/World/envs/env_0/Robot"
+                robot_prim = stage.GetPrimAtPath(self.robot_prim_path)
+                if not robot_prim.IsValid():
+                    print(f"[CAMERA] Robot still not found, using world camera")
+                    return self._setup_world_camera(stage)
+
+            # Check for base link
+            base_path = f"{self.robot_prim_path}/base"
+            base_prim = stage.GetPrimAtPath(base_path)
+            if not base_prim.IsValid():
+                print(f"[CAMERA] Base link not found, using world camera")
+                return self._setup_world_camera(stage)
+
+            # Create camera under base
+            self.camera_path = f"{base_path}/front_camera"
             camera_prim = stage.GetPrimAtPath(self.camera_path)
+
             if not camera_prim.IsValid():
-                print(f"[CAMERA] Creating camera at {self.camera_path}")
+                print(f"[CAMERA] Creating robot-mounted camera at {self.camera_path}")
                 camera = UsdGeom.Camera.Define(stage, self.camera_path)
-                camera.GetFocalLengthAttr().Set(24.0)
+                camera.GetFocalLengthAttr().Set(18.0)  # Wide angle
                 camera.GetHorizontalApertureAttr().Set(20.955)
                 camera.GetClippingRangeAttr().Set(Gf.Vec2f(0.1, 100.0))
 
-                # Set position (world camera looking at scene)
+                # Set local transform relative to base
                 xform = UsdGeom.Xformable(camera.GetPrim())
                 xform.ClearXformOpOrder()
-                xform.AddTranslateOp().Set(Gf.Vec3d(0.0, -5.0, 3.0))
-                # Rotate to look at origin
-                xform.AddRotateXYZOp().Set(Gf.Vec3f(60.0, 0.0, 0.0))
+                xform.AddTranslateOp().Set(Gf.Vec3d(*self.offset))
+                xform.AddRotateXYZOp().Set(Gf.Vec3f(*self.rotation))
 
-            # Create render product
-            self.render_product = rep.create.render_product(
-                self.camera_path,
-                resolution=(self.width, self.height)
-            )
+                print(f"[CAMERA] Offset: {self.offset}, Rotation: {self.rotation}")
 
-            # Create RGB annotator
-            self.rgb_annotator = rep.AnnotatorRegistry.get_annotator("rgb")
-            self.rgb_annotator.attach([self.render_product])
-
-            self.initialized = True
-            print(f"[CAMERA] Initialized! Resolution: {self.width}x{self.height}")
-            return True
+            return self._setup_replicator()
 
         except Exception as e:
             print(f"[CAMERA] Setup failed: {e}")
             traceback.print_exc()
             return False
 
+    def _setup_world_camera(self, stage):
+        """Fallback: Create world camera if robot mounting fails"""
+        self.camera_path = "/World/VLMCamera"
+        camera_prim = stage.GetPrimAtPath(self.camera_path)
+
+        if not camera_prim.IsValid():
+            print(f"[CAMERA] Creating world camera at {self.camera_path}")
+            camera = UsdGeom.Camera.Define(stage, self.camera_path)
+            camera.GetFocalLengthAttr().Set(24.0)
+            camera.GetHorizontalApertureAttr().Set(20.955)
+            camera.GetClippingRangeAttr().Set(Gf.Vec2f(0.1, 100.0))
+
+            xform = UsdGeom.Xformable(camera.GetPrim())
+            xform.ClearXformOpOrder()
+            xform.AddTranslateOp().Set(Gf.Vec3d(0.0, -5.0, 3.0))
+            xform.AddRotateXYZOp().Set(Gf.Vec3f(60.0, 0.0, 0.0))
+
+        return self._setup_replicator()
+
+    def _setup_replicator(self):
+        """Setup Replicator render product and annotator"""
+        try:
+            self.render_product = rep.create.render_product(
+                self.camera_path,
+                resolution=(self.width, self.height)
+            )
+
+            self.rgb_annotator = rep.AnnotatorRegistry.get_annotator("rgb")
+            self.rgb_annotator.attach([self.render_product])
+
+            self.initialized = True
+            print(f"[CAMERA] Initialized! Resolution: {self.width}x{self.height}")
+            print(f"[CAMERA] Path: {self.camera_path}")
+            return True
+
+        except Exception as e:
+            print(f"[CAMERA] Replicator setup failed: {e}")
+            return False
+
     def get_image(self) -> np.ndarray:
-        """Get current camera image without blocking"""
+        """Get current camera image (non-blocking)"""
         if not self.initialized:
             return None
 
+        self.warmup_counter += 1
+        if self.warmup_counter < self.warmup_frames:
+            return None
+
         try:
-            # Get data from annotator (non-blocking - uses last rendered frame)
             data = self.rgb_annotator.get_data()
 
             if data is not None and len(data) > 0:
-                # Convert to numpy array
                 if isinstance(data, np.ndarray):
                     img = data
                 else:
                     img = np.array(data)
 
-                # Handle different formats
                 if len(img.shape) == 3:
                     if img.shape[2] == 4:  # RGBA -> RGB
                         img = img[:, :, :3]
                     self.last_image = img
                     return img
 
-            return self.last_image  # Return last valid image
+            return self.last_image
 
         except Exception as e:
-            # Don't spam errors
             return self.last_image
+
+    def is_ready(self) -> bool:
+        return self.initialized and self.warmup_counter >= self.warmup_frames
 
 
 # ============================================================
-# VLM Navigator
+# OpenCV Viewport Display (NEW in v9)
+# ============================================================
+class ViewportDisplay:
+    """Ayrı pencerede kamera görüntüsü göster"""
+
+    def __init__(self, window_name: str = "Go2 Camera - Press V to toggle"):
+        self.window_name = window_name
+        self.enabled = CV2_AVAILABLE and not args_cli.no_viewport
+        self.window_created = False
+
+        # Overlay info
+        self.target_name = ""
+        self.command = (0.0, 0.0, 0.0)
+        self.status = "IDLE"
+        self.last_bbox = None
+
+    def setup(self):
+        if not self.enabled:
+            return False
+        try:
+            cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(self.window_name, 640, 480)
+            self.window_created = True
+            print(f"[VIEWPORT] Window created")
+            return True
+        except Exception as e:
+            print(f"[VIEWPORT] Setup failed: {e}")
+            self.enabled = False
+            return False
+
+    def update(self, image: np.ndarray, target: str = None, cmd: tuple = None,
+               status: str = None, bbox: list = None):
+        if not self.enabled or not self.window_created:
+            return
+
+        if target:
+            self.target_name = target
+        if cmd:
+            self.command = cmd
+        if status:
+            self.status = status
+        if bbox:
+            self.last_bbox = bbox
+
+        # Create display image
+        if image is None:
+            display = np.zeros((240, 320, 3), dtype=np.uint8)
+            cv2.putText(display, "Waiting for camera...", (50, 120),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        else:
+            # RGB to BGR for OpenCV
+            display = cv2.cvtColor(image.copy(), cv2.COLOR_RGB2BGR)
+
+            # Draw bounding box if available
+            if self.last_bbox:
+                x1, y1, x2, y2 = [int(v) for v in self.last_bbox]
+                cv2.rectangle(display, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.putText(display, self.target_name, (x1, y1 - 5),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+
+        # Draw overlay
+        h, w = display.shape[:2]
+
+        # Info bar at bottom
+        cv2.rectangle(display, (0, h - 50), (w, h), (30, 30, 30), -1)
+
+        # Target
+        cv2.putText(display, f"Target: {self.target_name}", (5, h - 32),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+
+        # Command
+        vx, vy, vyaw = self.command
+        cv2.putText(display, f"Cmd: vx={vx:.2f} vyaw={vyaw:.2f}", (5, h - 12),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
+
+        # Status
+        color = (0, 255, 0) if self.status == "FOUND" else (0, 165, 255)
+        cv2.putText(display, self.status, (w - 80, h - 12),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+
+        # Crosshair
+        cx, cy = w // 2, (h - 50) // 2
+        cv2.line(display, (cx - 15, cy), (cx + 15, cy), (255, 255, 255), 1)
+        cv2.line(display, (cx, cy - 15), (cx, cy + 15), (255, 255, 255), 1)
+
+        cv2.imshow(self.window_name, display)
+        cv2.waitKey(1)
+
+    def toggle(self):
+        if not CV2_AVAILABLE:
+            return
+
+        if self.window_created:
+            cv2.destroyWindow(self.window_name)
+            self.window_created = False
+            self.enabled = False
+            print("[VIEWPORT] Window closed")
+        else:
+            self.enabled = True
+            self.setup()
+
+    def close(self):
+        if self.window_created:
+            cv2.destroyAllWindows()
+
+
+# ============================================================
+# VLM Navigator with Improved Navigation Logic (v9)
 # ============================================================
 class VLMNavigator:
     COLOR_MAP = {"mavi": "blue", "kırmızı": "red", "yeşil": "green", "sarı": "yellow", "turuncu": "orange"}
@@ -187,6 +395,12 @@ class VLMNavigator:
         dummy[100:150, 100:150] = [255, 0, 0]
         self.find_object(dummy, "red box")
         print(f"[VLM] Ready! GPU: {torch.cuda.memory_allocated()/1e9:.2f} GB")
+
+        # Navigation parameters (NEW in v9)
+        self.forward_speed = 0.4
+        self.turn_gain = 0.6
+        self.approach_threshold = 0.2  # Screen center threshold
+        self.reached_distance = 0.25
 
     def find_object(self, image: np.ndarray, command: str):
         import time
@@ -223,19 +437,58 @@ class VLMNavigator:
         text = self.processor.batch_decode(out, skip_special_tokens=False)[0]
         parsed = self.processor.post_process_generation(text, task=task, image_size=(w, h))
 
-        result = {"found": False, "target": target, "x": 0.0, "distance": 1.0, "time_ms": (time.time()-t0)*1000}
+        result = {
+            "found": False,
+            "target": target,
+            "x": 0.0,
+            "distance": 1.0,
+            "time_ms": (time.time()-t0)*1000,
+            "bbox": None
+        }
 
         key = "<CAPTION_TO_PHRASE_GROUNDING>"
         if key in parsed and parsed[key].get("bboxes"):
             bbox = parsed[key]["bboxes"][0]
             x1, y1, x2, y2 = bbox
             cx = (x1+x2)/2
-            result["x"] = (cx / w) * 2 - 1
+            result["x"] = (cx / w) * 2 - 1  # Normalized [-1, 1]
             area = (x2-x1) * (y2-y1) / (w*h)
             result["distance"] = max(0.1, 1.0 - area * 5)
             result["found"] = True
+            result["bbox"] = bbox
 
         return result
+
+    def compute_navigation_command(self, result: dict, search_dir: float = 1.0):
+        """
+        Compute navigation command based on VLM detection result.
+
+        Returns:
+            (vx, vy, vyaw): Velocity command
+            status: "FOUND", "SEARCHING", "REACHED"
+        """
+        if not result["found"]:
+            # Search behavior: rotate in place
+            return (0.1, 0.0, 0.4 * search_dir), "SEARCHING"
+
+        x = result["x"]  # [-1, 1], 0 = center
+        dist = result["distance"]
+
+        # Check if reached
+        if dist < self.reached_distance and abs(x) < self.approach_threshold:
+            return (0.0, 0.0, 0.0), "REACHED"
+
+        # Navigation logic
+        if abs(x) < self.approach_threshold:
+            # Target centered - move forward
+            vx = self.forward_speed * (0.5 + dist * 0.5)  # Slow down when close
+            vyaw = 0.0
+        else:
+            # Target off-center - turn towards it
+            vx = self.forward_speed * 0.3  # Slow forward while turning
+            vyaw = -x * self.turn_gain  # Negative because x>0 means right, need to turn right (negative yaw)
+
+        return (vx, 0.0, vyaw), "FOUND"
 
 
 # ============================================================
@@ -333,7 +586,8 @@ def spawn_target_objects():
 # ============================================================
 def main():
     print("\n" + "="*60)
-    print("     VLM Navigation Demo - Go2 (v8 - Non-blocking Camera)")
+    print("   VLM Navigation Demo - Go2 (v9)")
+    print("   Robot-Mounted Camera + Viewport + Navigation")
     print("="*60)
 
     # Create environment
@@ -366,6 +620,7 @@ def main():
         print(f"[POLICY] Loaded! Hidden: {hidden_dims}")
     except Exception as e:
         print(f"[ERROR] Policy: {e}")
+        traceback.print_exc()
         return
 
     # Reset env first (this starts simulation)
@@ -375,14 +630,19 @@ def main():
     # Spawn objects
     spawn_target_objects()
 
+    # Get robot prim path for camera mounting
+    robot_prim_path = "/World/envs/env_0/Robot"
+
     # Setup camera AFTER simulation starts
     camera = None
     if not args_cli.no_camera:
-        print("\n[CAMERA] Setting up...")
-        camera = ReplicatorCamera(
-            camera_path="/World/VLMCamera",
+        print("\n[CAMERA] Setting up robot-mounted camera...")
+        camera = RobotMountedCamera(
+            robot_prim_path=robot_prim_path,
             width=320,
-            height=240
+            height=240,
+            offset=(0.35, 0.0, 0.15),  # Forward, left, up
+            rotation=(0.0, 15.0, 0.0)   # Pitch down
         )
 
         # Wait a few frames for simulation to stabilize
@@ -396,6 +656,11 @@ def main():
         if not camera.setup():
             print("[CAMERA] Setup failed, continuing without camera")
             camera = None
+
+    # Setup viewport display (NEW in v9)
+    viewport = ViewportDisplay()
+    if camera is not None:
+        viewport.setup()
 
     # Setup VLM
     vlm = None
@@ -418,18 +683,19 @@ def main():
     # Navigation state
     targets = ["mavi kutu", "kırmızı top", "yeşil kutu", "sarı koni", "turuncu kutu"]
     target_idx = 0
-    command = torch.tensor([[0.4, 0.0, 0.3]], device=device, dtype=torch.float32)
+    command = torch.tensor([[0.4, 0.0, 0.0]], device=device, dtype=torch.float32)
     search_dir = 1.0
+    nav_status = "IDLE"
+    last_bbox = None
 
     print("\n" + "="*60)
-    print("  SPACE - Next target | R - Reset | ESC - Quit")
+    print("  SPACE - Next target | R - Reset | V - Toggle viewport | ESC - Quit")
     print("="*60)
     print(f"\n[START] Target: {targets[target_idx]}")
-    print(f"[START] VLM: {vlm is not None}, Camera: {camera is not None}\n")
+    print(f"[START] VLM: {vlm is not None}, Camera: {camera is not None}, Viewport: {viewport.enabled}\n")
 
     step = 0
     vlm_interval = 30  # VLM every 30 steps (~0.6s at 50Hz)
-    camera_warmup = 50  # Wait for camera to warm up
 
     # Main loop
     while simulation_app.is_running():
@@ -441,51 +707,68 @@ def main():
 
         if keyboard.just_pressed("SPACE"):
             target_idx = (target_idx + 1) % len(targets)
+            search_dir *= -1  # Alternate search direction
+            last_bbox = None
             print(f"\n[TARGET] {targets[target_idx]}")
 
         if keyboard.just_pressed("R"):
             obs_dict, _ = env.reset()
             obs = obs_dict["policy"] if isinstance(obs_dict, dict) else obs_dict
+            last_bbox = None
             print("\n[RESET]")
+
+        if keyboard.just_pressed("V"):
+            viewport.toggle()
 
         # Debug every 100 steps
         if step % 100 == 0:
-            print(f"[STEP {step:5d}] cmd=[{command[0,0]:.2f}, {command[0,1]:.2f}, {command[0,2]:.2f}]")
+            print(f"[STEP {step:5d}] cmd=[{command[0,0]:.2f}, {command[0,1]:.2f}, {command[0,2]:.2f}] status={nav_status}")
 
         # VLM inference (after camera warmup)
-        if vlm is not None and camera is not None and step > camera_warmup and step % vlm_interval == 0:
+        if vlm is not None and camera is not None and camera.is_ready() and step % vlm_interval == 0:
             try:
                 img = camera.get_image()
 
                 if img is not None:
-                    if step % 100 == 0:
-                        print(f"[CAMERA] Got image: {img.shape}, dtype: {img.dtype}")
-
                     # VLM inference
                     result = vlm.find_object(img, targets[target_idx])
 
-                    if result["found"]:
-                        x = result["x"]
-                        dist = result["distance"]
-                        print(f"[VLM] FOUND '{result['target']}' x={x:.2f} d={dist:.2f} | {result['time_ms']:.0f}ms")
+                    # Compute navigation command (NEW in v9)
+                    cmd_tuple, nav_status = vlm.compute_navigation_command(result, search_dir)
+                    command = torch.tensor([cmd_tuple], device=device, dtype=torch.float32)
 
-                        if dist < 0.3 and abs(x) < 0.25:
-                            command = torch.tensor([[0.0, 0.0, 0.0]], device=device, dtype=torch.float32)
+                    if result["found"]:
+                        last_bbox = result["bbox"]
+                        print(f"[VLM] {nav_status} '{result['target']}' x={result['x']:.2f} d={result['distance']:.2f} | {result['time_ms']:.0f}ms")
+                        if nav_status == "REACHED":
                             print(f"[VLM] ★ TARGET REACHED ★")
-                        else:
-                            angular = -x * 0.5
-                            linear = 0.3 + dist * 0.2
-                            command = torch.tensor([[linear, 0.0, angular]], device=device, dtype=torch.float32)
                     else:
-                        print(f"[VLM] SEARCHING '{result['target']}' | {result['time_ms']:.0f}ms")
-                        command = torch.tensor([[0.15, 0.0, 0.4 * search_dir]], device=device, dtype=torch.float32)
-                else:
-                    if step % 100 == 0:
-                        print(f"[CAMERA] No image yet")
+                        last_bbox = None
+                        if step % 100 == 0:
+                            print(f"[VLM] SEARCHING '{result['target']}' | {result['time_ms']:.0f}ms")
+
+                    # Update viewport
+                    viewport.update(
+                        image=img,
+                        target=targets[target_idx],
+                        cmd=cmd_tuple,
+                        status=nav_status,
+                        bbox=last_bbox
+                    )
 
             except Exception as e:
                 if step % 100 == 0:
                     print(f"[VLM] Error: {e}")
+
+        # Update viewport even without VLM (for camera preview)
+        elif camera is not None and camera.is_ready() and step % 5 == 0:
+            img = camera.get_image()
+            viewport.update(
+                image=img,
+                target=targets[target_idx],
+                cmd=tuple(command[0].cpu().tolist()),
+                status=nav_status
+            )
 
         # Apply velocity command
         if cmd_term is not None:
@@ -514,7 +797,8 @@ def main():
 
         step += 1
 
-    print("\n[EXIT] Done")
+    print("\n[EXIT] Cleaning up...")
+    viewport.close()
     env.close()
     simulation_app.close()
 

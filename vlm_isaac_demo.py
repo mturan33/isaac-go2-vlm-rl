@@ -796,7 +796,7 @@ def main():
             width=320,
             height=240,
             offset=(0.40, 0.0, 0.10),    # Forward, left, up
-            rotation=(90.0, 0.0, 0.0)    # Rotate to look forward (+X direction)
+            rotation=(0.0, -90.0, 0.0)   # Y-axis rotation to look forward (+X)
         )
 
         # Wait a few frames for simulation to stabilize

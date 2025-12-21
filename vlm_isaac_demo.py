@@ -97,10 +97,19 @@ import omni.replicator.core as rep
 
 # OpenCV for viewport (optional)
 CV2_AVAILABLE = False
+CV2_GUI_AVAILABLE = False
 try:
     import cv2
     CV2_AVAILABLE = True
-    print("[VIEWPORT] OpenCV loaded")
+    # Test if GUI functions are available
+    try:
+        # This will fail if highgui is not compiled with GUI support
+        cv2.namedWindow("_test_", cv2.WINDOW_NORMAL)
+        cv2.destroyWindow("_test_")
+        CV2_GUI_AVAILABLE = True
+        print("[VIEWPORT] OpenCV GUI loaded")
+    except cv2.error:
+        print("[VIEWPORT] OpenCV loaded but GUI not available (headless mode)")
 except ImportError:
     print("[VIEWPORT] OpenCV not available")
 
@@ -266,8 +275,9 @@ class ViewportDisplay:
 
     def __init__(self, window_name: str = "Go2 Camera - Press V to toggle"):
         self.window_name = window_name
-        self.enabled = CV2_AVAILABLE and not args_cli.no_viewport
+        self.enabled = CV2_GUI_AVAILABLE and not args_cli.no_viewport
         self.window_created = False
+        self.setup_failed = False  # Prevent repeated error messages
 
         # Overlay info
         self.target_name = ""
@@ -276,6 +286,11 @@ class ViewportDisplay:
         self.last_bbox = None
 
     def setup(self):
+        if not CV2_GUI_AVAILABLE:
+            if not self.setup_failed:
+                print("[VIEWPORT] GUI not available - skipping viewport window")
+                self.setup_failed = True
+            return False
         if not self.enabled:
             return False
         try:
@@ -285,7 +300,9 @@ class ViewportDisplay:
             print(f"[VIEWPORT] Window created")
             return True
         except Exception as e:
-            print(f"[VIEWPORT] Setup failed: {e}")
+            if not self.setup_failed:
+                print(f"[VIEWPORT] Setup failed: {e}")
+                self.setup_failed = True
             self.enabled = False
             return False
 
@@ -348,7 +365,8 @@ class ViewportDisplay:
         cv2.waitKey(1)
 
     def toggle(self):
-        if not CV2_AVAILABLE:
+        if not CV2_GUI_AVAILABLE:
+            print("[VIEWPORT] GUI not available - cannot toggle")
             return
 
         if self.window_created:
@@ -358,6 +376,7 @@ class ViewportDisplay:
             print("[VIEWPORT] Window closed")
         else:
             self.enabled = True
+            self.setup_failed = False  # Allow retry
             self.setup()
 
     def close(self):
@@ -725,43 +744,51 @@ def main():
             print(f"[STEP {step:5d}] cmd=[{command[0,0]:.2f}, {command[0,1]:.2f}, {command[0,2]:.2f}] status={nav_status}")
 
         # VLM inference (after camera warmup)
-        if vlm is not None and camera is not None and camera.is_ready() and step % vlm_interval == 0:
-            try:
-                img = camera.get_image()
+        if vlm is not None and camera is not None and step % vlm_interval == 0:
+            # Debug camera status
+            if step % 100 == 0:
+                print(f"[DEBUG] Camera ready: {camera.is_ready()}, warmup: {camera.warmup_counter}/{camera.warmup_frames}")
 
-                if img is not None:
-                    # VLM inference
-                    result = vlm.find_object(img, targets[target_idx])
+            if camera.is_ready():
+                try:
+                    img = camera.get_image()
 
-                    # Compute navigation command (NEW in v9)
-                    cmd_tuple, nav_status = vlm.compute_navigation_command(result, search_dir)
-                    command = torch.tensor([cmd_tuple], device=device, dtype=torch.float32)
+                    if img is not None:
+                        # VLM inference
+                        result = vlm.find_object(img, targets[target_idx])
 
-                    if result["found"]:
-                        last_bbox = result["bbox"]
-                        print(f"[VLM] {nav_status} '{result['target']}' x={result['x']:.2f} d={result['distance']:.2f} | {result['time_ms']:.0f}ms")
-                        if nav_status == "REACHED":
-                            print(f"[VLM] ★ TARGET REACHED ★")
-                    else:
-                        last_bbox = None
-                        if step % 100 == 0:
+                        # Compute navigation command (NEW in v9)
+                        cmd_tuple, nav_status = vlm.compute_navigation_command(result, search_dir)
+                        command = torch.tensor([cmd_tuple], device=device, dtype=torch.float32)
+
+                        if result["found"]:
+                            last_bbox = result["bbox"]
+                            print(f"[VLM] {nav_status} '{result['target']}' x={result['x']:.2f} d={result['distance']:.2f} | {result['time_ms']:.0f}ms")
+                            if nav_status == "REACHED":
+                                print(f"[VLM] ★ TARGET REACHED ★")
+                        else:
+                            last_bbox = None
                             print(f"[VLM] SEARCHING '{result['target']}' | {result['time_ms']:.0f}ms")
 
-                    # Update viewport
-                    viewport.update(
-                        image=img,
-                        target=targets[target_idx],
-                        cmd=cmd_tuple,
-                        status=nav_status,
-                        bbox=last_bbox
-                    )
+                        # Update viewport
+                        viewport.update(
+                            image=img,
+                            target=targets[target_idx],
+                            cmd=cmd_tuple,
+                            status=nav_status,
+                            bbox=last_bbox
+                        )
+                    else:
+                        if step % 100 == 0:
+                            print(f"[DEBUG] Camera returned None image")
 
-            except Exception as e:
-                if step % 100 == 0:
+                except Exception as e:
                     print(f"[VLM] Error: {e}")
+                    import traceback
+                    traceback.print_exc()
 
         # Update viewport even without VLM (for camera preview)
-        elif camera is not None and camera.is_ready() and step % 5 == 0:
+        elif camera is not None and camera.is_ready() and step % 5 == 0 and viewport.enabled:
             img = camera.get_image()
             viewport.update(
                 image=img,

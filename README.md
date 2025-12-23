@@ -158,3 +158,14 @@ This project includes code from:
 - unitree_sim_isaaclab (https://github.com/unitreerobotics/unitree_sim_isaaclab)
   Copyright 2025 HangZhou YuShu TECHNOLOGY CO.,LTD. ("Unitree Robotics")
   Licensed under Apache License 2.0
+
+
+This code builds upon following open-source code-bases. Please visit the URLs to see the respective LICENSES:
+
+1. https://github.com/isaac-sim/IsaacLab
+2. https://github.com/isaac-sim/IsaacSim
+3. https://github.com/zeromq/pyzmq
+4. https://github.com/unitreerobotics/unitree_sdk2_python
+5. https://github.com/unitreerobotics/unitree_sim_isaaclab
+
+------------------

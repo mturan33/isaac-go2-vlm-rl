@@ -150,3 +150,11 @@ MIT License
 Mehmet Turan Yardımcı
 - GitHub: [@mturan33](https://github.com/mturan33)
 - LinkedIn: [/in/mehmetturanyardimci](https://linkedin.com/in/mehmetturanyardimci)
+
+# Kendi projenin LICENSE veya README'sine ekle:
+
+## Acknowledgements & Third-Party Code
+This project includes code from:
+- unitree_sim_isaaclab (https://github.com/unitreerobotics/unitree_sim_isaaclab)
+  Copyright 2025 HangZhou YuShu TECHNOLOGY CO.,LTD. ("Unitree Robotics")
+  Licensed under Apache License 2.0

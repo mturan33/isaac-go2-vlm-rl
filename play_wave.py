@@ -1,4 +1,4 @@
-# G1 Wave Demo v5 - Joint Debug + Correct Indices
+# G1 Wave Demo v6 - FINAL - Prominent Wave Animation
 #
 # Kullanım:
 #   cd C:\IsaacLab
@@ -20,7 +20,7 @@ parser.add_argument("--num_envs", type=int, default=16)
 parser.add_argument("--load_run", type=str, required=True)
 parser.add_argument("--checkpoint", type=str, default=None)
 parser.add_argument("--wave_hand", type=str, default="right", choices=["left", "right", "both", "none"])
-parser.add_argument("--wave_freq", type=float, default=2.0)
+parser.add_argument("--wave_freq", type=float, default=2.5)  # Biraz daha hızlı
 
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
@@ -50,55 +50,48 @@ def find_checkpoint(run_dir: str, checkpoint: str = None) -> str:
 
 def main():
     print("\n" + "=" * 70)
-    print("  G1 WALK + WAVE DEMO v5 - With Joint Debug")
+    print("  G1 WALK + WAVE DEMO v6 - Prominent Wave Animation")
     print("=" * 70 + "\n")
 
     env_cfg = parse_env_cfg(args_cli.task, device=args_cli.device, num_envs=args_cli.num_envs)
     env = gym.make(args_cli.task, cfg=env_cfg)
 
-    # === DEBUG: Joint isimlerini al ===
+    # Get joint names
     unwrapped = env.unwrapped
     robot = unwrapped.scene["robot"]
     joint_names = robot.joint_names
 
-    print("\n" + "=" * 70)
-    print("  G1 JOINT NAMES (Action Space Order)")
-    print("=" * 70)
-    for i, name in enumerate(joint_names):
-        arm_marker = ""
-        if "shoulder" in name or "elbow" in name or "wrist" in name:
-            arm_marker = " <-- ARM"
-        print(f"  [{i:2d}] {name}{arm_marker}")
-    print("=" * 70 + "\n")
+    # G1 Joint Mapping (from debug output):
+    # [ 5] left_shoulder_pitch_joint
+    # [ 6] right_shoulder_pitch_joint
+    # [ 9] left_shoulder_roll_joint
+    # [10] right_shoulder_roll_joint
+    # [13] left_shoulder_yaw_joint
+    # [14] right_shoulder_yaw_joint
+    # [17] left_elbow_pitch_joint  <-- Dirsek bükme
+    # [18] right_elbow_pitch_joint
+    # [21] left_elbow_roll_joint   <-- Dirsek döndürme
+    # [22] right_elbow_roll_joint
 
-    # === Doğru arm indekslerini bul ===
-    arm_indices = {}
-    for i, name in enumerate(joint_names):
-        # Left arm
-        if "left_shoulder_pitch" in name:
-            arm_indices["left_shoulder_pitch"] = i
-        elif "left_shoulder_roll" in name:
-            arm_indices["left_shoulder_roll"] = i
-        elif "left_shoulder_yaw" in name:
-            arm_indices["left_shoulder_yaw"] = i
-        elif "left_elbow" in name:
-            arm_indices["left_elbow"] = i
-        # Right arm
-        elif "right_shoulder_pitch" in name:
-            arm_indices["right_shoulder_pitch"] = i
-        elif "right_shoulder_roll" in name:
-            arm_indices["right_shoulder_roll"] = i
-        elif "right_shoulder_yaw" in name:
-            arm_indices["right_shoulder_yaw"] = i
-        elif "right_elbow" in name:
-            arm_indices["right_elbow"] = i
+    ARM_JOINTS = {
+        "left_shoulder_pitch": 5,
+        "right_shoulder_pitch": 6,
+        "left_shoulder_roll": 9,
+        "right_shoulder_roll": 10,
+        "left_shoulder_yaw": 13,
+        "right_shoulder_yaw": 14,
+        "left_elbow_pitch": 17,
+        "right_elbow_pitch": 18,
+        "left_elbow_roll": 21,
+        "right_elbow_roll": 22,
+    }
 
-    print("Detected arm indices:")
-    for name, idx in sorted(arm_indices.items()):
-        print(f"  {name}: {idx}")
+    print("Using hardcoded arm indices:")
+    for name, idx in sorted(ARM_JOINTS.items(), key=lambda x: x[1]):
+        print(f"  [{idx:2d}] {name}")
     print()
 
-    # Checkpoint path
+    # Checkpoint
     run_dir = os.path.join("logs", "rsl_rl", "g1_flat", args_cli.load_run)
     resume_path = find_checkpoint(run_dir, args_cli.checkpoint)
     print(f"[INFO] Loading: {resume_path}")
@@ -132,7 +125,7 @@ def main():
 
     print("\n" + "-" * 50)
     print(" Running... Ctrl+C to exit")
-    print(" Robots will WALK and WAVE!")
+    print(" Robots will WALK and WAVE! 👋")
     print("-" * 50 + "\n")
 
     try:
@@ -140,29 +133,35 @@ def main():
             with torch.no_grad():
                 actions = policy(obs)
 
-            # === Wave Override with CORRECT indices ===
+            # === WAVE ANIMATION ===
             if args_cli.wave_hand != "none":
-                wave = 0.5 * math.sin(2.0 * math.pi * args_cli.wave_freq * sim_time)
+                # Sinusoidal wave - daha belirgin
+                wave = math.sin(2.0 * math.pi * args_cli.wave_freq * sim_time)
 
+                # === SAĞ KOL ===
                 if args_cli.wave_hand in ["right", "both"]:
-                    if "right_shoulder_pitch" in arm_indices:
-                        actions[:, arm_indices["right_shoulder_pitch"]] = -1.5  # Kaldır
-                    if "right_shoulder_roll" in arm_indices:
-                        actions[:, arm_indices["right_shoulder_roll"]] = -0.5 + wave * 0.6
-                    if "right_shoulder_yaw" in arm_indices:
-                        actions[:, arm_indices["right_shoulder_yaw"]] = -wave * 0.3
-                    if "right_elbow" in arm_indices:
-                        actions[:, arm_indices["right_elbow"]] = -1.0 - wave * 0.3
+                    # Kolu YUKARI kaldır (shoulder_pitch negatif = yukarı)
+                    actions[:, ARM_JOINTS["right_shoulder_pitch"]] = -2.5  # Daha yukarı!
 
+                    # Kolu YANA aç (shoulder_roll)
+                    actions[:, ARM_JOINTS["right_shoulder_roll"]] = -0.8 + wave * 0.4
+
+                    # Kolu DÖNDÜR (shoulder_yaw) - sallama hareketi
+                    actions[:, ARM_JOINTS["right_shoulder_yaw"]] = wave * 0.5
+
+                    # Dirseği BÜK (elbow_pitch) - el yukarıda
+                    actions[:, ARM_JOINTS["right_elbow_pitch"]] = -1.5 + wave * 0.3
+
+                    # Dirsek roll
+                    actions[:, ARM_JOINTS["right_elbow_roll"]] = wave * 0.2
+
+                # === SOL KOL ===
                 if args_cli.wave_hand in ["left", "both"]:
-                    if "left_shoulder_pitch" in arm_indices:
-                        actions[:, arm_indices["left_shoulder_pitch"]] = -1.5
-                    if "left_shoulder_roll" in arm_indices:
-                        actions[:, arm_indices["left_shoulder_roll"]] = 0.5 + wave * 0.6
-                    if "left_shoulder_yaw" in arm_indices:
-                        actions[:, arm_indices["left_shoulder_yaw"]] = wave * 0.3
-                    if "left_elbow" in arm_indices:
-                        actions[:, arm_indices["left_elbow"]] = -1.0 + wave * 0.3
+                    actions[:, ARM_JOINTS["left_shoulder_pitch"]] = -2.5
+                    actions[:, ARM_JOINTS["left_shoulder_roll"]] = 0.8 + wave * 0.4
+                    actions[:, ARM_JOINTS["left_shoulder_yaw"]] = -wave * 0.5
+                    actions[:, ARM_JOINTS["left_elbow_pitch"]] = -1.5 - wave * 0.3
+                    actions[:, ARM_JOINTS["left_elbow_roll"]] = -wave * 0.2
 
             # Step
             step_result = env.step(actions)

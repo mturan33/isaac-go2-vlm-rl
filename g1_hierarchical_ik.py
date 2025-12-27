@@ -1,16 +1,13 @@
 # Copyright (c) 2025, VLM-RL G1 Project
-# G1 Hierarchical Control V2: PPO Locomotion + Real DifferentialIK
-# Uses PhysX Jacobians for accurate task-space control
+# G1 Hierarchical Control: PPO Locomotion + DifferentialIK + Debug Visualization
 
 """
-G1 Hierarchical Control V2 - Advanced IK Integration
-=====================================================
-
-Bu script, Isaac Lab'ın DifferentialIKController'ını gerçek PhysX Jacobian'ları
-ile kullanarak task-space arm kontrolü sağlar.
+G1 Hierarchical Control with Hand Trajectory Visualization
+===========================================================
 
 Lower Body: PPO Locomotion Policy (trained 20K iterations)
 Upper Body: DifferentialIKController with PhysX Jacobians
+Visualization: Debug draw for hand trajectory
 
 Kullanım:
     cd C:\IsaacLab
@@ -21,12 +18,14 @@ import argparse
 import os
 import math
 import torch
-from typing import Tuple, Optional
+import torch.nn as nn
+from typing import Tuple, Optional, List
+from collections import deque
 
 # ==== Isaac Lab App Launcher ====
 from isaaclab.app import AppLauncher
 
-parser = argparse.ArgumentParser(description="G1 Hierarchical Control V2: PPO + Real IK")
+parser = argparse.ArgumentParser(description="G1 Hierarchical Control: PPO + IK + Visualization")
 parser.add_argument("--num_envs", type=int, default=4)
 parser.add_argument("--load_run", type=str, required=True, help="Locomotion policy run folder")
 parser.add_argument("--checkpoint", type=str, default=None)
@@ -34,6 +33,7 @@ parser.add_argument("--ik_method", type=str, default="dls", choices=["dls", "pin
 parser.add_argument("--target_mode", type=str, default="circle",
                     choices=["circle", "static", "wave", "reach", "track_object"])
 parser.add_argument("--arm", type=str, default="right", choices=["left", "right", "both"])
+parser.add_argument("--draw_trajectory", action="store_true", default=True, help="Draw hand trajectory")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
@@ -43,17 +43,17 @@ simulation_app = app_launcher.app
 # ==== Post-Launch Imports ====
 import torch
 from isaaclab.controllers import DifferentialIKController, DifferentialIKControllerCfg
-from isaaclab.utils.math import subtract_frame_transforms, quat_from_euler_xyz
+from isaaclab.utils.math import subtract_frame_transforms
 from isaaclab.envs import ManagerBasedRLEnv
 
-# RSL-RL
+# Debug Draw
 try:
-    from rsl_rl.modules import ActorCritic
+    from isaacsim.util.debug_draw import _debug_draw
 
-    RSL_RL_AVAILABLE = True
+    DEBUG_DRAW_AVAILABLE = True
 except ImportError:
-    RSL_RL_AVAILABLE = False
-    print("[Warning] RSL-RL not available")
+    DEBUG_DRAW_AVAILABLE = False
+    print("[Warning] Debug draw not available")
 
 # Isaac Lab tasks
 import isaaclab_tasks  # noqa: F401
@@ -62,7 +62,6 @@ import isaaclab_tasks  # noqa: F401
 # G1 ARM CONFIGURATION
 ##############################################################################
 
-# G1 Joint names for arms (from URDF)
 G1_ARM_JOINTS = {
     "right": [
         "right_shoulder_pitch_joint",
@@ -80,17 +79,118 @@ G1_ARM_JOINTS = {
     ],
 }
 
-# End-effector body names
 G1_EE_BODIES = {
     "right": "right_palm_link",
     "left": "left_palm_link",
 }
 
-# Arm joint indices in the 37 DoF action space
 ARM_JOINT_INDICES = {
     "right": [6, 10, 14, 18, 22],
     "left": [5, 9, 13, 17, 21],
 }
+
+
+##############################################################################
+# CUSTOM ACTOR NETWORK (Compatible with RSL-RL checkpoint)
+##############################################################################
+
+class CustomActorCritic(nn.Module):
+    """
+    Custom ActorCritic that can load RSL-RL checkpoints regardless of API version.
+    """
+
+    def __init__(
+            self,
+            num_obs: int,
+            num_actions: int,
+            actor_hidden_dims: List[int] = [512, 256, 128],
+            critic_hidden_dims: List[int] = [512, 256, 128],
+            activation: str = "elu",
+    ):
+        super().__init__()
+
+        self.num_obs = num_obs
+        self.num_actions = num_actions
+
+        # Activation function
+        if activation == "elu":
+            act_fn = nn.ELU()
+        elif activation == "relu":
+            act_fn = nn.ReLU()
+        elif activation == "tanh":
+            act_fn = nn.Tanh()
+        else:
+            act_fn = nn.ELU()
+
+        # Build actor network
+        actor_layers = []
+        prev_dim = num_obs
+        for hidden_dim in actor_hidden_dims:
+            actor_layers.append(nn.Linear(prev_dim, hidden_dim))
+            actor_layers.append(act_fn)
+            prev_dim = hidden_dim
+        actor_layers.append(nn.Linear(prev_dim, num_actions))
+        self.actor = nn.Sequential(*actor_layers)
+
+        # Build critic network
+        critic_layers = []
+        prev_dim = num_obs
+        for hidden_dim in critic_hidden_dims:
+            critic_layers.append(nn.Linear(prev_dim, hidden_dim))
+            critic_layers.append(act_fn)
+            prev_dim = hidden_dim
+        critic_layers.append(nn.Linear(prev_dim, 1))
+        self.critic = nn.Sequential(*critic_layers)
+
+        # Action noise (log std)
+        self.std = nn.Parameter(torch.ones(num_actions))
+
+        print(f"[Policy] Created CustomActorCritic: obs={num_obs}, actions={num_actions}")
+        print(f"[Policy] Actor: {actor_hidden_dims} -> {num_actions}")
+
+    def forward(self, obs):
+        return self.actor(obs)
+
+    def act_inference(self, obs):
+        """Get deterministic action for inference."""
+        with torch.no_grad():
+            return self.actor(obs)
+
+    def load_rsl_rl_checkpoint(self, checkpoint_path: str, device: str):
+        """Load weights from RSL-RL checkpoint."""
+        data = torch.load(checkpoint_path, map_location=device, weights_only=False)
+
+        if "model_state_dict" not in data:
+            raise ValueError("Checkpoint does not contain 'model_state_dict'")
+
+        state_dict = data["model_state_dict"]
+
+        # Map RSL-RL keys to our model
+        new_state_dict = {}
+
+        for key, value in state_dict.items():
+            # Actor layers: actor.0.weight -> actor.0.weight
+            if key.startswith("actor."):
+                new_state_dict[key] = value
+            # Critic layers: critic.0.weight -> critic.0.weight
+            elif key.startswith("critic."):
+                new_state_dict[key] = value
+            # Std parameter
+            elif key == "std":
+                new_state_dict["std"] = value
+            elif key == "log_std":
+                # Convert log_std to std if needed
+                new_state_dict["std"] = torch.exp(value)
+
+        # Load with strict=False to handle any mismatches
+        missing, unexpected = self.load_state_dict(new_state_dict, strict=False)
+
+        if missing:
+            print(f"[Policy] Missing keys: {missing}")
+        if unexpected:
+            print(f"[Policy] Unexpected keys: {unexpected}")
+
+        return True
 
 
 ##############################################################################
@@ -107,7 +207,6 @@ def find_checkpoint(run_dir: str, checkpoint_name: str = None) -> str:
         if os.path.exists(path):
             return path
 
-    # Find latest checkpoint
     checkpoints = [f for f in os.listdir(run_dir) if f.startswith("model_") and f.endswith(".pt")]
     if not checkpoints:
         raise FileNotFoundError(f"No checkpoints found in {run_dir}")
@@ -117,18 +216,118 @@ def find_checkpoint(run_dir: str, checkpoint_name: str = None) -> str:
 
 
 ##############################################################################
-# ARM IK CONTROLLER WRAPPER
+# TRAJECTORY VISUALIZER
+##############################################################################
+
+class TrajectoryVisualizer:
+    """Visualize hand trajectory using debug draw."""
+
+    def __init__(self, num_envs: int, max_points: int = 200):
+        self.num_envs = num_envs
+        self.max_points = max_points
+        self.enabled = DEBUG_DRAW_AVAILABLE
+
+        # Store trajectory points for each environment
+        self.trajectories = [deque(maxlen=max_points) for _ in range(num_envs)]
+        self.target_trajectories = [deque(maxlen=max_points) for _ in range(num_envs)]
+
+        # Colors (RGBA)
+        self.hand_colors = [
+            (1.0, 0.0, 0.0, 1.0),  # Red - env 0
+            (0.0, 1.0, 0.0, 1.0),  # Green - env 1
+            (0.0, 0.0, 1.0, 1.0),  # Blue - env 2
+            (1.0, 1.0, 0.0, 1.0),  # Yellow - env 3
+        ]
+        self.target_colors = [
+            (1.0, 0.5, 0.5, 0.5),  # Light red
+            (0.5, 1.0, 0.5, 0.5),  # Light green
+            (0.5, 0.5, 1.0, 0.5),  # Light blue
+            (1.0, 1.0, 0.5, 0.5),  # Light yellow
+        ]
+
+        if self.enabled:
+            self.draw = _debug_draw.acquire_debug_draw_interface()
+            print("[Viz] Trajectory visualizer initialized")
+        else:
+            self.draw = None
+            print("[Viz] Debug draw not available")
+
+    def add_point(self, env_id: int, hand_pos: torch.Tensor, target_pos: torch.Tensor):
+        """Add a point to the trajectory."""
+        if not self.enabled:
+            return
+
+        # Convert to list for storage
+        hand_pt = hand_pos.cpu().tolist() if torch.is_tensor(hand_pos) else hand_pos
+        target_pt = target_pos.cpu().tolist() if torch.is_tensor(target_pos) else target_pos
+
+        self.trajectories[env_id].append(hand_pt)
+        self.target_trajectories[env_id].append(target_pt)
+
+    def draw_all(self):
+        """Draw all trajectories."""
+        if not self.enabled or self.draw is None:
+            return
+
+        try:
+            # Clear previous drawings
+            self.draw.clear_lines()
+            self.draw.clear_points()
+
+            for env_id in range(self.num_envs):
+                traj = list(self.trajectories[env_id])
+                target_traj = list(self.target_trajectories[env_id])
+
+                # Draw hand trajectory as connected lines
+                if len(traj) > 1:
+                    for i in range(len(traj) - 1):
+                        p1 = traj[i]
+                        p2 = traj[i + 1]
+                        color = self.hand_colors[env_id % len(self.hand_colors)]
+                        self.draw.draw_line(p1, color, p2, color)
+
+                # Draw target trajectory (dashed effect with points)
+                if len(target_traj) > 1:
+                    for i in range(0, len(target_traj), 3):  # Every 3rd point
+                        pt = target_traj[i]
+                        color = self.target_colors[env_id % len(self.target_colors)]
+                        self.draw.draw_point(pt, color, 5.0)
+
+                # Draw current hand position (larger point)
+                if traj:
+                    current = traj[-1]
+                    color = self.hand_colors[env_id % len(self.hand_colors)]
+                    self.draw.draw_point(current, color, 15.0)
+
+                # Draw current target (sphere-like with multiple points)
+                if target_traj:
+                    target = target_traj[-1]
+                    color = (1.0, 1.0, 1.0, 1.0)  # White
+                    self.draw.draw_point(target, color, 20.0)
+
+        except Exception as e:
+            print(f"[Viz] Draw error: {e}")
+
+    def reset(self, env_ids: torch.Tensor = None):
+        """Clear trajectories for reset environments."""
+        if env_ids is None:
+            for traj in self.trajectories:
+                traj.clear()
+            for traj in self.target_trajectories:
+                traj.clear()
+        else:
+            for idx in env_ids.tolist():
+                if idx < len(self.trajectories):
+                    self.trajectories[idx].clear()
+                    self.target_trajectories[idx].clear()
+
+
+##############################################################################
+# ARM IK CONTROLLER
 ##############################################################################
 
 class G1ArmIKController:
-    """
-    Wrapper for DifferentialIKController specialized for G1 arm control.
-
-    Handles:
-    - Jacobian extraction from robot
-    - Frame transformations (world -> base)
-    - Joint index mapping
-    """
+    """DifferentialIK controller for G1 arm."""
 
     def __init__(
             self,
@@ -141,188 +340,114 @@ class G1ArmIKController:
         self.device = device
         self.arm = arm
 
-        # Create DifferentialIK controller config
         self.ik_cfg = DifferentialIKControllerCfg(
-            command_type="pose",  # 7D pose (position + quaternion)
-            use_relative_mode=False,  # Absolute targets
+            command_type="pose",
+            use_relative_mode=False,
             ik_method=ik_method,
             ik_params={"lambda_val": 0.1} if ik_method == "dls" else {"k_val": 1.0},
         )
 
-        # Create the controller instance
         self.controller = DifferentialIKController(
             self.ik_cfg,
             num_envs=num_envs,
             device=device,
         )
 
-        # Body and joint indices (will be set when robot is available)
         self.ee_body_idx = None
         self.arm_joint_ids = None
-        self.ee_jacobi_idx = None  # Jacobian index for end-effector
-
-        # State buffers
+        self.ee_jacobi_idx = None
         self.target_pos = torch.zeros(num_envs, 3, device=device)
         self.target_quat = torch.zeros(num_envs, 4, device=device)
-        self.target_quat[:, 0] = 1.0  # Identity quaternion (w=1)
+        self.target_quat[:, 0] = 1.0
         self.initialized = False
 
         print(f"[IK] Created G1ArmIKController for {arm} arm (method: {ik_method})")
 
     def initialize_from_robot(self, robot, scene):
-        """
-        Initialize body and joint indices from robot articulation.
-
-        Args:
-            robot: Isaac Lab Articulation object
-            scene: InteractiveScene containing the robot
-        """
+        """Initialize from robot articulation."""
         try:
-            # Find end-effector body index
             ee_name = G1_EE_BODIES[self.arm]
-
-            # Try to find the body
             body_names = robot.body_names if hasattr(robot, 'body_names') else []
-            print(f"[IK] Robot body names: {body_names[:10]}..." if len(
-                body_names) > 10 else f"[IK] Robot body names: {body_names}")
 
-            # Find EE body index
             if ee_name in body_names:
                 self.ee_body_idx = body_names.index(ee_name)
                 print(f"[IK] Found {ee_name} at body index {self.ee_body_idx}")
             else:
-                # Try alternative names
-                alt_names = [f"{self.arm}_five_link", f"{self.arm}_hand_link", f"{self.arm}_wrist_link"]
-                for alt in alt_names:
-                    if alt in body_names:
-                        self.ee_body_idx = body_names.index(alt)
-                        print(f"[IK] Using alternative {alt} at index {self.ee_body_idx}")
-                        break
+                self.ee_body_idx = 29  # Fallback
+                print(f"[IK] Using fallback EE index {self.ee_body_idx}")
 
-                if self.ee_body_idx is None:
-                    print(f"[IK] Warning: Could not find end-effector body, using fallback")
-                    self.ee_body_idx = len(body_names) - 1  # Use last body as fallback
-
-            # Find arm joint indices
             joint_names = robot.joint_names if hasattr(robot, 'joint_names') else []
-            print(f"[IK] Robot joint names: {joint_names[:10]}..." if len(
-                joint_names) > 10 else f"[IK] Robot joint names: {joint_names}")
-
             self.arm_joint_ids = []
             for jname in G1_ARM_JOINTS[self.arm]:
-                # Try exact match first
                 if jname in joint_names:
                     self.arm_joint_ids.append(joint_names.index(jname))
-                else:
-                    # Try partial match
-                    for i, name in enumerate(joint_names):
-                        if jname.replace("_joint", "") in name:
-                            self.arm_joint_ids.append(i)
-                            break
 
             if len(self.arm_joint_ids) < 5:
-                print(f"[IK] Warning: Only found {len(self.arm_joint_ids)} arm joints, using defaults")
                 self.arm_joint_ids = ARM_JOINT_INDICES[self.arm]
+                print(f"[IK] Using default arm joint indices: {self.arm_joint_ids}")
+            else:
+                print(f"[IK] Found arm joint indices: {self.arm_joint_ids}")
 
-            print(f"[IK] Arm joint indices: {self.arm_joint_ids}")
-
-            # Jacobian index for EE
-            self.ee_jacobi_idx = self.ee_body_idx - 1  # Usually body_idx - 1 for Jacobian
-
-            self.initialized = True
-            print(f"[IK] Initialization complete!")
-
-        except Exception as e:
-            print(f"[IK] Error during initialization: {e}")
-            # Use fallback indices
-            self.ee_body_idx = 20  # Approximate
-            self.arm_joint_ids = ARM_JOINT_INDICES[self.arm]
             self.ee_jacobi_idx = self.ee_body_idx - 1
             self.initialized = True
 
+        except Exception as e:
+            print(f"[IK] Init error: {e}")
+            self.ee_body_idx = 29
+            self.arm_joint_ids = ARM_JOINT_INDICES[self.arm]
+            self.ee_jacobi_idx = 28
+            self.initialized = True
+
     def set_target(self, target_pos: torch.Tensor, target_quat: torch.Tensor = None):
-        """Set target end-effector pose in base frame."""
+        """Set target pose."""
         self.target_pos = target_pos.clone()
 
-        # Default orientation: identity quaternion (wxyz format)
         if target_quat is None:
             target_quat = torch.zeros(self.num_envs, 4, device=self.device)
-            target_quat[:, 0] = 1.0  # w = 1 for identity
+            target_quat[:, 0] = 1.0
 
         self.target_quat = target_quat.clone()
-
-        # Combine into 7D pose command (x, y, z, qw, qx, qy, qz)
         pose_command = torch.cat([target_pos, target_quat], dim=-1)
         self.controller.set_command(pose_command)
 
-    def compute(
-            self,
-            robot,
-            jacobian: torch.Tensor = None,
-    ) -> torch.Tensor:
-        """
-        Compute arm joint positions using IK.
-
-        Args:
-            robot: Articulation object with current state
-            jacobian: Optional pre-computed Jacobian
-
-        Returns:
-            Joint positions for arm joints (num_envs, num_arm_joints)
-        """
+    def compute(self, robot, jacobian: torch.Tensor = None) -> torch.Tensor:
+        """Compute IK solution."""
         if not self.initialized:
-            print("[IK] Warning: Controller not initialized!")
             return torch.zeros(self.num_envs, len(self.arm_joint_ids), device=self.device)
 
         try:
-            # Get current joint positions
             joint_pos = robot.data.joint_pos[:, self.arm_joint_ids]
 
-            # Get current EE pose in world frame
             ee_pose_w = robot.data.body_state_w[:, self.ee_body_idx, 0:7]
             ee_pos_w = ee_pose_w[:, 0:3]
             ee_quat_w = ee_pose_w[:, 3:7]
 
-            # Get root pose
             root_pose_w = robot.data.root_state_w[:, 0:7]
             root_pos_w = root_pose_w[:, 0:3]
             root_quat_w = root_pose_w[:, 3:7]
 
-            # Transform EE pose to base frame
             ee_pos_b, ee_quat_b = subtract_frame_transforms(
-                root_pos_w, root_quat_w,
-                ee_pos_w, ee_quat_w
+                root_pos_w, root_quat_w, ee_pos_w, ee_quat_w
             )
 
-            # Get or compute Jacobian
             if jacobian is None:
-                # Extract Jacobian from PhysX
                 full_jacobian = robot.root_physx_view.get_jacobians()
-                # Shape: (num_envs, num_bodies, 6, num_joints)
-                # Extract full 6DoF Jacobian for arm joints
-                jacobian = full_jacobian[:, self.ee_jacobi_idx, :, :]  # Full 6DoF
-                jacobian = jacobian[:, :, self.arm_joint_ids]  # Arm joints only
+                jacobian = full_jacobian[:, self.ee_jacobi_idx, :, :]
+                jacobian = jacobian[:, :, self.arm_joint_ids]
 
-            # Compute IK
-            joint_pos_des = self.controller.compute(
-                ee_pos_b,
-                ee_quat_b,
-                jacobian,
-                joint_pos,
-            )
-
+            joint_pos_des = self.controller.compute(ee_pos_b, ee_quat_b, jacobian, joint_pos)
             return joint_pos_des
 
         except Exception as e:
             print(f"[IK] Compute error: {e}")
-            import traceback
-            traceback.print_exc()
-            # Return current positions as fallback
-            return robot.data.joint_pos[:, self.arm_joint_ids] if hasattr(robot.data, 'joint_pos') else \
-                torch.zeros(self.num_envs, len(self.arm_joint_ids), device=self.device)
+            return robot.data.joint_pos[:, self.arm_joint_ids]
+
+    def get_ee_pos_world(self, robot) -> torch.Tensor:
+        """Get current end-effector position in world frame."""
+        return robot.data.body_state_w[:, self.ee_body_idx, 0:3]
 
     def reset(self, env_ids: torch.Tensor = None):
-        """Reset controller state."""
+        """Reset controller."""
         if env_ids is None:
             self.target_pos.zero_()
             self.target_quat.zero_()
@@ -335,99 +460,20 @@ class G1ArmIKController:
 
 
 ##############################################################################
-# SIMPLE ARM IK (FALLBACK)
-##############################################################################
-
-class SimpleArmIK:
-    """
-    Simplified geometric IK fallback for G1 arm.
-    Used when DifferentialIKController initialization fails.
-    """
-
-    def __init__(self, num_envs: int, device: str, arm: str = "right"):
-        self.num_envs = num_envs
-        self.device = device
-        self.arm = arm
-        self.arm_joint_ids = ARM_JOINT_INDICES[arm]
-
-        # Joint position buffer
-        self.joint_pos = torch.zeros(num_envs, 5, device=device)
-
-        # Default position (arm slightly forward)
-        self.default_pos = torch.tensor([0.3, -0.3 if arm == "right" else 0.3, 0.5], device=device)
-
-    def set_target(self, target_pos: torch.Tensor):
-        """Set target position."""
-        self.target_pos = target_pos.clone()
-
-    def compute(self, current_ee_pos: torch.Tensor, target_pos: torch.Tensor, dt: float = 0.02) -> torch.Tensor:
-        """Compute joint deltas using geometric approximation."""
-        error = target_pos - current_ee_pos
-        gain = 3.0
-
-        # Simplified Jacobian-like mapping
-        deltas = torch.zeros(self.num_envs, 5, device=self.device)
-
-        # Shoulder pitch: forward/back + up/down
-        deltas[:, 0] = -gain * (error[:, 0] * 0.4 + error[:, 2] * 0.6) * dt
-
-        # Shoulder roll: left/right
-        sign = -1.0 if self.arm == "right" else 1.0
-        deltas[:, 1] = sign * gain * error[:, 1] * 0.5 * dt
-
-        # Shoulder yaw: rotation
-        deltas[:, 2] = gain * (error[:, 0] * 0.1 - error[:, 1] * 0.1) * dt
-
-        # Elbow pitch: reach
-        deltas[:, 3] = -gain * (error[:, 0] * 0.3 + error[:, 2] * 0.4) * dt
-
-        # Elbow roll: minimal
-        deltas[:, 4] = 0.0
-
-        # Clamp and integrate
-        deltas = torch.clamp(deltas, -0.15, 0.15)
-        self.joint_pos += deltas
-
-        # Apply joint limits
-        self.joint_pos[:, 0] = torch.clamp(self.joint_pos[:, 0], -2.5, 2.0)
-        self.joint_pos[:, 1] = torch.clamp(self.joint_pos[:, 1], -1.2, 1.0)
-        self.joint_pos[:, 2] = torch.clamp(self.joint_pos[:, 2], -1.2, 1.2)
-        self.joint_pos[:, 3] = torch.clamp(self.joint_pos[:, 3], -2.5, 0.0)
-        self.joint_pos[:, 4] = torch.clamp(self.joint_pos[:, 4], -1.0, 1.0)
-
-        return self.joint_pos.clone()
-
-    def reset(self, env_ids: torch.Tensor = None):
-        if env_ids is None:
-            self.joint_pos.zero_()
-        else:
-            self.joint_pos[env_ids] = 0.0
-
-
-##############################################################################
-# TARGET TRAJECTORY GENERATOR
+# TARGET GENERATOR
 ##############################################################################
 
 class TargetGenerator:
     """Generate target trajectories for end-effector."""
 
-    def __init__(
-            self,
-            num_envs: int,
-            device: str,
-            mode: str = "circle",
-            arm: str = "right",
-    ):
+    def __init__(self, num_envs: int, device: str, mode: str = "circle", arm: str = "right"):
         self.num_envs = num_envs
         self.device = device
         self.mode = mode
         self.arm = arm
 
-        # Base position for right/left arm
         y_offset = -0.25 if arm == "right" else 0.25
         self.base_position = torch.tensor([0.35, y_offset, 0.55], device=device)
-
-        # Motion parameters
         self.radius = 0.12
         self.freq = 0.4
 
@@ -439,170 +485,99 @@ class TargetGenerator:
             angle = 2 * math.pi * self.freq * time
             pos[:, 0] += self.radius * math.cos(angle)
             pos[:, 2] += self.radius * math.sin(angle)
-
         elif self.mode == "wave":
             wave = math.sin(2 * math.pi * self.freq * time)
             pos[:, 1] += wave * self.radius
-
         elif self.mode == "reach":
             wave = math.sin(2 * math.pi * 0.3 * time)
             pos[:, 2] += wave * 0.15
             pos[:, 0] += (1 + wave) * 0.05
 
-        elif self.mode == "track_object":
-            # Future: will be replaced with VLM-detected object position
-            angle = 2 * math.pi * 0.2 * time
-            pos[:, 0] += 0.1 * math.cos(angle)
-            pos[:, 1] += 0.05 * math.sin(2 * angle)
-            pos[:, 2] += 0.08 * math.sin(angle)
-
         return pos
 
 
 ##############################################################################
-# MAIN SIMULATION
+# MAIN
 ##############################################################################
 
 def main():
-    """Main simulation loop with hierarchical control."""
+    """Main simulation loop."""
 
     print("=" * 70)
-    print("  G1 Hierarchical Control V2")
-    print("  Lower Body: PPO Locomotion (20K iterations)")
-    print("  Upper Body: DifferentialIK with PhysX Jacobians")
+    print("  G1 Hierarchical Control with Trajectory Visualization")
+    print("  Lower Body: PPO Locomotion")
+    print("  Upper Body: DifferentialIK")
+    print("  Visualization: Hand + Target Trajectories")
     print("=" * 70)
 
     # ==== Environment Setup ====
     from isaaclab_tasks.manager_based.locomotion.velocity.config.g1.flat_env_cfg import G1FlatEnvCfg
-    from isaaclab.envs import ManagerBasedRLEnv
 
-    # Create environment config
     env_cfg = G1FlatEnvCfg()
     env_cfg.scene.num_envs = args_cli.num_envs
-
-    # Create environment directly (not through gym.make)
     env = ManagerBasedRLEnv(cfg=env_cfg)
 
-    # Get dimensions from observation/action managers
     obs_dim = env.observation_manager.group_obs_dim["policy"][0]
     action_dim = env.action_manager.total_action_dim
 
-    print(f"\n[Env] Task: G1 Flat Locomotion")
-    print(f"[Env] Num envs: {env.num_envs}")
-    print(f"[Env] Obs dim: {obs_dim}")
-    print(f"[Env] Action dim: {action_dim}")
-    print(f"[Env] Device: {env.device}")
+    print(f"\n[Env] Obs dim: {obs_dim}, Action dim: {action_dim}")
 
-    # ==== Try to access robot from environment ====
+    # ==== Get Robot ====
     robot = None
-    scene = None
-    use_real_ik = False
+    scene = env.scene
+    if hasattr(scene, 'articulations') and 'robot' in scene.articulations:
+        robot = scene.articulations['robot']
+        print("[Env] Robot articulation found!")
 
+    # ==== Load Policy ====
+    policy = None
     try:
-        # Access scene from ManagerBasedRLEnv
-        scene = env.scene
-        print(f"[Env] Found scene: {type(scene)}")
+        run_dir = os.path.join("logs", "rsl_rl", "g1_flat", args_cli.load_run)
+        checkpoint_path = find_checkpoint(run_dir, args_cli.checkpoint)
+        print(f"\n[Policy] Loading: {checkpoint_path}")
 
-        # Get robot articulation
-        if hasattr(scene, 'articulations'):
-            articulations = scene.articulations
-            print(f"[Env] Articulations: {list(articulations.keys())}")
+        # Create custom policy
+        policy = CustomActorCritic(
+            num_obs=obs_dim,
+            num_actions=action_dim,
+            actor_hidden_dims=[512, 256, 128],
+            critic_hidden_dims=[512, 256, 128],
+            activation="elu",
+        ).to(env.device)
 
-            if 'robot' in articulations:
-                robot = articulations['robot']
-                print(f"[Env] Found robot articulation!")
-                use_real_ik = True
+        # Load checkpoint
+        policy.load_rsl_rl_checkpoint(checkpoint_path, env.device)
+        policy.eval()
+        print("[Policy] ✓ Locomotion policy loaded successfully!")
 
     except Exception as e:
-        print(f"[Env] Could not access robot: {e}")
+        print(f"[Policy] ✗ Error: {e}")
+        import traceback
+        traceback.print_exc()
+        policy = None
 
-    # ==== Load PPO Policy ====
-    policy = None
-    if RSL_RL_AVAILABLE:
-        try:
-            run_dir = os.path.join("logs", "rsl_rl", "g1_flat", args_cli.load_run)
-            checkpoint_path = find_checkpoint(run_dir, args_cli.checkpoint)
-
-            print(f"\n[Policy] Loading: {checkpoint_path}")
-
-            loaded = torch.load(checkpoint_path, map_location=env.device, weights_only=False)
-
-            if "model_state_dict" in loaded:
-                try:
-                    from rsl_rl.modules import ActorCritic
-
-                    policy = ActorCritic(
-                        num_actor_obs=obs_dim,
-                        num_critic_obs=obs_dim,
-                        num_actions=action_dim,
-                        actor_hidden_dims=[512, 256, 128],
-                        critic_hidden_dims=[512, 256, 128],
-                    ).to(env.device)
-
-                    policy.load_state_dict(loaded["model_state_dict"])
-                    policy.eval()
-                    print("[Policy] ✓ PPO locomotion policy loaded!")
-
-                except TypeError as e:
-                    print(f"[Policy] Trying alternative loading method...")
-
-                    class PolicyWrapper:
-                        def __init__(self, state_dict, device):
-                            self.device = device
-
-                        def act_inference(self, obs):
-                            return torch.zeros(obs.shape[0], action_dim, device=self.device)
-
-                    policy = PolicyWrapper(loaded["model_state_dict"], env.device)
-                    print("[Policy] Using fallback policy wrapper")
-
-        except Exception as e:
-            print(f"[Policy] ✗ Error loading policy: {e}")
-            policy = None
-
-    if policy is None:
-        print("[Policy] Using simple standing control (zero actions)")
-
-    # ==== Create Arm IK Controller ====
+    # ==== Create IK Controller ====
     arm = args_cli.arm
-
-    if use_real_ik and robot is not None:
-        arm_ik = G1ArmIKController(
-            env.num_envs,
-            env.device,
-            arm=arm,
-            ik_method=args_cli.ik_method,
-        )
+    arm_ik = G1ArmIKController(env.num_envs, env.device, arm=arm, ik_method=args_cli.ik_method)
+    if robot is not None:
         arm_ik.initialize_from_robot(robot, scene)
-        print(f"[IK] Using DifferentialIK with PhysX Jacobians")
-    else:
-        arm_ik = SimpleArmIK(env.num_envs, env.device, arm=arm)
-        print(f"[IK] Using SimpleArmIK fallback")
-        use_real_ik = False
 
     # ==== Create Target Generator ====
-    target_gen = TargetGenerator(
-        env.num_envs,
-        env.device,
-        args_cli.target_mode,
-        arm=arm,
-    )
-    print(f"[Target] Mode: {args_cli.target_mode}")
+    target_gen = TargetGenerator(env.num_envs, env.device, args_cli.target_mode, arm=arm)
 
-    # ==== Reset Environment ====
+    # ==== Create Trajectory Visualizer ====
+    visualizer = TrajectoryVisualizer(env.num_envs, max_points=300)
+
+    # ==== Reset ====
     obs_dict, _ = env.reset()
     obs = obs_dict["policy"]
-
-    # Initial values
     actions = torch.zeros(env.num_envs, action_dim, device=env.device)
     arm_joint_ids = ARM_JOINT_INDICES[arm]
 
-    # Approximate EE position tracker (for fallback)
-    approx_ee_pos = target_gen.base_position.unsqueeze(0).expand(env.num_envs, -1).clone()
-
-    # ==== Simulation Loop ====
     print("\n" + "-" * 70)
     print("[Info] Starting simulation... Press Ctrl+C to stop")
+    print("[Info] Hand trajectory: Colored lines")
+    print("[Info] Target: White dots")
     print("-" * 70)
 
     sim_time = 0.0
@@ -611,56 +586,47 @@ def main():
 
     try:
         while simulation_app.is_running():
-
             # ==== Get Target ====
             target_pos = target_gen.get_target(sim_time)
 
-            # ==== Compute Actions ====
-
-            # --- Lower Body: PPO Policy ---
+            # ==== Lower Body: PPO Policy ====
             if policy is not None:
                 with torch.no_grad():
-                    policy_actions = policy.act_inference(obs)
-                    actions = policy_actions.clone()
+                    actions = policy.act_inference(obs)
             else:
                 actions.zero_()
 
-            # --- Upper Body: IK Control ---
-            if use_real_ik and isinstance(arm_ik, G1ArmIKController):
-                # Set target
+            # ==== Upper Body: IK Control ====
+            if robot is not None and arm_ik.initialized:
                 arm_ik.set_target(target_pos)
-
-                # Compute IK
                 arm_joints = arm_ik.compute(robot)
 
-                # Override arm joints
+                # Override arm joints (blend with policy output)
                 for i, idx in enumerate(arm_joint_ids):
                     if i < arm_joints.shape[1]:
                         actions[:, idx] = arm_joints[:, i]
 
-            else:
-                # Use simple IK
-                arm_joints = arm_ik.compute(approx_ee_pos, target_pos, dt)
+                # ==== Visualization ====
+                if args_cli.draw_trajectory and step_count % 2 == 0:  # Every other step
+                    ee_pos_w = arm_ik.get_ee_pos_world(robot)
+                    for env_id in range(env.num_envs):
+                        # Transform target to world frame (approximate)
+                        root_pos = robot.data.root_state_w[env_id, 0:3]
+                        target_world = target_pos[env_id] + root_pos
+                        visualizer.add_point(env_id, ee_pos_w[env_id], target_world)
 
-                # Override arm joints
-                for i, idx in enumerate(arm_joint_ids):
-                    actions[:, idx] = arm_joints[:, i]
+                    visualizer.draw_all()
 
-                # Update approximate EE position
-                approx_ee_pos = 0.9 * approx_ee_pos + 0.1 * target_pos
-
-            # ==== Step Environment ====
+            # ==== Step ====
             obs_dict, rewards, terminated, truncated, info = env.step(actions)
             obs = obs_dict["policy"]
 
-            # Handle resets
+            # ==== Handle Resets ====
             reset_ids = (terminated | truncated).nonzero(as_tuple=False).squeeze(-1)
             if len(reset_ids) > 0:
                 arm_ik.reset(reset_ids)
-                if not use_real_ik:
-                    approx_ee_pos[reset_ids] = target_gen.base_position
+                visualizer.reset(reset_ids)
 
-            # ==== Update Time ====
             sim_time += dt
             step_count += 1
 
@@ -668,13 +634,18 @@ def main():
             if step_count % 200 == 0:
                 mean_reward = rewards.mean().item()
                 alive = (~terminated).float().mean().item() * 100
-
-                # Target position
                 target_str = f"[{target_pos[0, 0]:.2f}, {target_pos[0, 1]:.2f}, {target_pos[0, 2]:.2f}]"
+
+                # Get actual EE position for comparison
+                if robot is not None:
+                    ee_pos = arm_ik.get_ee_pos_world(robot)[0]
+                    ee_str = f"[{ee_pos[0]:.2f}, {ee_pos[1]:.2f}, {ee_pos[2]:.2f}]"
+                else:
+                    ee_str = "N/A"
 
                 print(f"[Step {step_count:5d}] t={sim_time:6.2f}s | "
                       f"Reward: {mean_reward:7.3f} | Alive: {alive:5.1f}% | "
-                      f"Target: {target_str}")
+                      f"Target: {target_str} | EE: {ee_str}")
 
     except KeyboardInterrupt:
         print("\n[Info] Stopped by user")
@@ -683,10 +654,6 @@ def main():
         env.close()
         print("[Info] Environment closed")
 
-
-##############################################################################
-# ENTRY POINT
-##############################################################################
 
 if __name__ == "__main__":
     main()

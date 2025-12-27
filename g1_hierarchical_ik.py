@@ -389,14 +389,21 @@ class G1ArmIKController:
 
             if jacobian is None:
                 full_jacobian = robot.root_physx_view.get_jacobians()
+                # Shape: (num_envs, num_bodies-1, 6, num_dofs)
                 jacobian = full_jacobian[:, self.ee_jacobi_idx, :, :]
+                # Now shape: (num_envs, 6, num_dofs)
                 jacobian = jacobian[:, :, self.arm_joint_ids]
+                # Now shape: (num_envs, 6, 5) for 5 arm joints
 
+            # Compute IK
             joint_pos_des = self.controller.compute(ee_pos_b, ee_quat_b, jacobian, joint_pos)
+
             return joint_pos_des
 
         except Exception as e:
             print(f"[IK] Compute error: {e}")
+            import traceback
+            traceback.print_exc()
             return robot.data.joint_pos[:, self.arm_joint_ids]
 
     def get_ee_pos_world(self, robot) -> torch.Tensor:
@@ -556,13 +563,39 @@ def main():
 
             # ==== Upper Body: IK Control ====
             if robot is not None and arm_ik.initialized:
-                arm_ik.set_target(target_pos)
-                arm_joints = arm_ik.compute(robot)
+                # Option 1: Simple sinusoidal test (to verify action pipeline)
+                USE_SIMPLE_TEST = True  # Set True to test without IK
 
-                # Override arm joints (blend with policy output)
-                for i, idx in enumerate(arm_joint_ids):
-                    if i < arm_joints.shape[1]:
-                        actions[:, idx] = arm_joints[:, i]
+                if USE_SIMPLE_TEST:
+                    # Simple sinusoidal motion for shoulder pitch (index 6)
+                    wave = math.sin(2 * math.pi * 0.5 * sim_time) * 0.5  # ±0.5 rad
+                    actions[:, 6] = wave  # right_shoulder_pitch
+                    actions[:, 18] = wave * 0.5  # right_elbow_pitch
+
+                    if step_count % 500 == 1:
+                        print(f"[Test] Sinusoidal wave: {wave:.3f}")
+                else:
+                    # Option 2: Full IK control
+                    arm_ik.set_target(target_pos)
+                    arm_joints_abs = arm_ik.compute(robot)  # Absolute joint positions
+
+                    # Get current joint positions
+                    current_arm_joints = robot.data.joint_pos[:, arm_joint_ids]
+
+                    # Debug logging
+                    if step_count % 500 == 1:
+                        print(f"[IK Debug] Current arm joints: {current_arm_joints[0].cpu().numpy()}")
+                        print(f"[IK Debug] IK absolute output: {arm_joints_abs[0].cpu().numpy()}")
+                        print(f"[IK Debug] Target (base): {target_pos[0].cpu().numpy()}")
+                        ee_pos_b = arm_ik.get_ee_pos_world(robot)[0] - robot.data.root_state_w[0, 0:3]
+                        print(f"[IK Debug] Current EE (base): {ee_pos_b.cpu().numpy()}")
+                        diff = arm_joints_abs[0] - current_arm_joints[0]
+                        print(f"[IK Debug] Joint diff: {diff.cpu().numpy()}")
+
+                    # Write IK output to actions
+                    for i, idx in enumerate(arm_joint_ids):
+                        if i < arm_joints_abs.shape[1]:
+                            actions[:, idx] = arm_joints_abs[:, i]
 
                 # ==== Visualization ====
                 if args_cli.draw_trajectory and step_count % 2 == 0:  # Every other step

@@ -561,49 +561,55 @@ def main():
             else:
                 actions.zero_()
 
-            # ==== Upper Body: IK Control ====
+            # ==== Upper Body: Arm Control ====
+            # DifferentialIK has issues (joint_diff=0), using simple analytical control instead
             if robot is not None and arm_ik.initialized:
-                # Option 1: Simple sinusoidal test (to verify action pipeline)
-                USE_SIMPLE_TEST = True  # Set True to test without IK
+                # Get target in base frame
+                target_b = target_pos[0]  # [x, y, z]
 
-                if USE_SIMPLE_TEST:
-                    # More aggressive sinusoidal motion - use step_count for reliable timing
-                    phase = step_count * 0.05  # Faster oscillation
-                    wave = math.sin(phase) * 1.0  # ±1.0 rad (larger amplitude)
+                # Simple analytical IK for reaching motion
+                # Target: [0.35 to 0.47, -0.25, 0.44 to 0.67] (circle in XZ plane)
 
-                    # Right arm joint indices: [6, 10, 14, 18, 22]
-                    # right_shoulder_pitch, right_shoulder_roll, right_shoulder_yaw,
-                    # right_elbow_pitch, right_elbow_roll
-                    actions[:, 6] = wave  # right_shoulder_pitch - forward/back
-                    actions[:, 18] = -wave * 0.5  # right_elbow_pitch - bend elbow
+                # Shoulder pitch: controls forward/back reach
+                # More negative = arm goes forward/up
+                # Target x is ~0.35-0.47, we want to reach forward
+                shoulder_pitch = -1.5 - (target_b[0].item() - 0.35) * 2.0  # Range: -1.5 to -1.74
 
-                    # Debug every 100 steps
-                    if step_count % 100 == 1:
-                        print(f"[Test] Step {step_count}: wave={wave:.3f}, action[6]={actions[0, 6].item():.3f}")
-                        current_joint = robot.data.joint_pos[0, 6].item()
-                        print(f"[Test] Current joint[6] pos: {current_joint:.3f}")
-                else:
-                    # Option 2: Full IK control
-                    arm_ik.set_target(target_pos)
-                    arm_joints_abs = arm_ik.compute(robot)  # Absolute joint positions
+                # Shoulder roll: controls arm spread (negative = away from body for right arm)
+                shoulder_roll = -0.3
 
-                    # Get current joint positions
-                    current_arm_joints = robot.data.joint_pos[:, arm_joint_ids]
+                # Shoulder yaw: rotation around arm axis
+                shoulder_yaw = 0.0
 
-                    # Debug logging
-                    if step_count % 500 == 1:
-                        print(f"[IK Debug] Current arm joints: {current_arm_joints[0].cpu().numpy()}")
-                        print(f"[IK Debug] IK absolute output: {arm_joints_abs[0].cpu().numpy()}")
-                        print(f"[IK Debug] Target (base): {target_pos[0].cpu().numpy()}")
-                        ee_pos_b = arm_ik.get_ee_pos_world(robot)[0] - robot.data.root_state_w[0, 0:3]
-                        print(f"[IK Debug] Current EE (base): {ee_pos_b.cpu().numpy()}")
-                        diff = arm_joints_abs[0] - current_arm_joints[0]
-                        print(f"[IK Debug] Joint diff: {diff.cpu().numpy()}")
+                # Elbow pitch: controls elbow bend
+                # Higher target z = less bend needed
+                elbow_pitch = -1.2 + (target_b[2].item() - 0.5) * 1.5  # Adjust based on height
 
-                    # Write IK output to actions
-                    for i, idx in enumerate(arm_joint_ids):
-                        if i < arm_joints_abs.shape[1]:
-                            actions[:, idx] = arm_joints_abs[:, i]
+                # Elbow roll
+                elbow_roll = 0.0
+
+                # Apply to actions
+                # arm_joint_ids = [6, 10, 14, 18, 22]
+                # [right_shoulder_pitch, right_shoulder_roll, right_shoulder_yaw, right_elbow_pitch, right_elbow_roll]
+                actions[:, 6] = shoulder_pitch
+                actions[:, 10] = shoulder_roll
+                actions[:, 14] = shoulder_yaw
+                actions[:, 18] = elbow_pitch
+                actions[:, 22] = elbow_roll
+
+                # Debug logging
+                if step_count % 100 == 1:
+                    ee_pos_w = robot.data.body_state_w[0, arm_ik.ee_body_idx, 0:3]
+                    root_pos_w = robot.data.root_state_w[0, 0:3]
+                    ee_pos_b = ee_pos_w - root_pos_w
+                    error = torch.norm(target_b - ee_pos_b).item()
+
+                    print(f"\n[Arm Control Step {step_count}]")
+                    print(f"  Target: [{target_b[0].item():.2f}, {target_b[1].item():.2f}, {target_b[2].item():.2f}]")
+                    print(f"  EE pos: [{ee_pos_b[0].item():.2f}, {ee_pos_b[1].item():.2f}, {ee_pos_b[2].item():.2f}]")
+                    print(f"  Error:  {error:.3f}m")
+                    print(
+                        f"  Joints: sh_pitch={shoulder_pitch:.2f}, sh_roll={shoulder_roll:.2f}, el_pitch={elbow_pitch:.2f}")
 
                 # ==== Visualization ====
                 if args_cli.draw_trajectory and step_count % 2 == 0:  # Every other step
